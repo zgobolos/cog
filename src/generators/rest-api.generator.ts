@@ -218,6 +218,7 @@ export const parseJsonBody = async <T = Record<string, unknown>>(c: Context): Pr
  * Anything not listed here stays a 500: it is a bug or an outage, not a client mistake.
  */
 const CLIENT_ERROR_STATUS_BY_SQLSTATE: Record<string, 400 | 409> = {
+  '23001': 409, // restrict_violation - the row is still referenced
   '23505': 409, // unique_violation
   '23502': 400, // not_null_violation
   '23503': 400, // foreign_key_violation

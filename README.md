@@ -489,6 +489,10 @@ many-to-many relationships are always created in the default schema, even when t
 
 **Actions:** `CASCADE`, `SET NULL`, `RESTRICT`, `NO ACTION`
 
+These are emitted onto the generated Drizzle column, so drizzle-kit creates the foreign key with them. A many-to-many
+relationship can declare `onDelete`/`onUpdate` too; its junction foreign keys cascade by default, because a junction row
+is meaningless once either side is gone. A delete refused by `RESTRICT` answers **409**.
+
 ### Field Exposure Control
 
 Control field visibility in API responses:

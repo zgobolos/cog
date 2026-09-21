@@ -1282,6 +1282,51 @@ async function runTests(): Promise<void> {
   logSuccess('✓ Non-default schema: DDL creates the table in analytics and CRUD works there');
 
   // ========================================
+  // 19. REFERENTIAL ACTIONS
+  // ========================================
+  logSection('19. Testing Foreign Key Referential Actions');
+
+  // IDCard.employeeId declares onDelete CASCADE and Employee.departmentId declares RESTRICT.
+  // Without those actions on the generated schema both would silently fall back to NO ACTION.
+  logStep('19.1 Deleting an employee cascades to its ID card');
+  const fkDept = await POST('/api/department', {
+    name: 'Referential Actions Dept',
+    location: { type: 'Point', coordinates: [19.04, 47.49] },
+  }) as Department;
+  const fkEmployee = await POST('/api/employee', {
+    firstName: 'Cascade',
+    lastName: 'Probe',
+    email: 'cascade.probe@example.com',
+    departmentId: fkDept.id,
+  }) as Employee;
+  const fkCard = await POST('/api/idcard', {
+    employeeId: fkEmployee.id,
+    cardNumber: 'FK-001',
+    issueDate: new Date('2024-01-01').getTime(),
+    expiryDate: new Date('2029-01-01').getTime(),
+  }) as IDCard;
+
+  await DELETE(`/api/employee/${fkEmployee.id}`);
+  const cascadedCard = await REQUEST('GET', `/api/idcard/${fkCard.id}`);
+  assertEquals(cascadedCard.status, 404, 'onDelete CASCADE must remove the ID card with its employee');
+
+  logStep('19.2 A department with employees cannot be deleted (RESTRICT)');
+  const restrictEmployee = await POST('/api/employee', {
+    firstName: 'Restrict',
+    lastName: 'Probe',
+    email: 'restrict.probe@example.com',
+    departmentId: fkDept.id,
+  }) as Employee;
+  const restricted = await REQUEST('DELETE', `/api/department/${fkDept.id}`);
+  assertEquals(restricted.status, 409, 'onDelete RESTRICT must refuse the delete with HTTP 409');
+
+  // and it succeeds once nothing references it any more
+  await DELETE(`/api/employee/${restrictEmployee.id}`);
+  const allowed = await REQUEST('DELETE', `/api/department/${fkDept.id}`);
+  assertEquals(allowed.status, 200, 'the department is deletable once no employee references it');
+  logSuccess('✓ Referential actions: CASCADE removes the child, RESTRICT blocks the parent delete');
+
+  // ========================================
   // SUCCESS
   // ========================================
   logSection('All Tests Passed!');

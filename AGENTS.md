@@ -328,6 +328,7 @@ malformed body is a 400 instead of an unhandled 500. Call sites pass the expecte
 | SQLSTATE          | Condition             | HTTP |
 | ----------------- | --------------------- | ---- |
 | `23505`           | unique violation      | 409  |
+| `23001`           | restrict violation    | 409  |
 | `23502`           | not-null violation    | 400  |
 | `23503`           | foreign key violation | 400  |
 | `23514`           | check violation       | 400  |

@@ -236,6 +236,34 @@ export class DrizzleSchemaGenerator {
   }
 
   /**
+   * Referential actions as drizzle's options object.
+   *
+   * A foreign key does not only say where a row points, it also says what happens when the
+   * parent goes away. Without these the database falls back to NO ACTION and the declared
+   * intent is silently lost. The model writes them in SQL's uppercase form, drizzle expects
+   * lowercase.
+   */
+  private referentialActions(actions: { onDelete?: string; onUpdate?: string }): string {
+    const options = [
+      actions.onDelete ? `onDelete: '${actions.onDelete.toLowerCase()}'` : null,
+      actions.onUpdate ? `onUpdate: '${actions.onUpdate.toLowerCase()}'` : null,
+    ].filter(Boolean);
+
+    return options.length > 0 ? `, { ${options.join(', ')} }` : '';
+  }
+
+  /**
+   * Referential actions as a drizzle foreignKey() builder chain.
+   * A junction row is meaningless once either side is gone, so it cascades by default.
+   */
+  private junctionReferentialActions(relationship: RelationshipDefinition): string {
+    const onDelete = (relationship.onDelete ?? 'CASCADE').toLowerCase();
+    const onUpdate = relationship.onUpdate ? `.onUpdate('${relationship.onUpdate.toLowerCase()}')` : '';
+
+    return `.onDelete('${onDelete}')${onUpdate}`;
+  }
+
+  /**
    * Index method for a column, or null for the default (btree).
    * GiST for spatial and GIN for JSON are accepted by both PostgreSQL and CockroachDB -
    * CockroachDB maps both onto its inverted indexes.
@@ -476,17 +504,16 @@ export class DrizzleSchemaGenerator {
     }
 
     if (field.references) {
+      const target = `${field.references.model.toLowerCase()}Table.${field.references.field}`;
+      const actions = this.referentialActions(field.references);
+
       // Check if this is a self-reference
       if (field.references.model.toLowerCase() === model.name.toLowerCase()) {
         // Use AnyPgColumn type hint for self-references
-        modifiers.push(
-          `.references((): AnyPgColumn => ${field.references.model.toLowerCase()}Table.${field.references.field})`,
-        );
+        modifiers.push(`.references((): AnyPgColumn => ${target}${actions})`);
         comment = ' // Self-reference: AnyPgColumn breaks circular type dependency';
       } else {
-        modifiers.push(
-          `.references(() => ${field.references.model.toLowerCase()}Table.${field.references.field})`,
-        );
+        modifiers.push(`.references(() => ${target}${actions})`);
       }
     }
 
@@ -766,16 +793,18 @@ export class DrizzleSchemaGenerator {
     code += `  primaryKey({ columns: [table.${sourceFKColumn}, table.${targetFKColumn}], ` +
       `name: '${junctionPrimaryKeyName(tableName)}' }),\n`;
 
+    const junctionActions = this.junctionReferentialActions(relationship);
+
     code += `  foreignKey({\n` +
       `    columns: [table.${sourceFKColumn}],\n` +
       `    foreignColumns: [${sourceModel.name.toLowerCase()}Table.${sourcePK.name}],\n` +
       `    name: '${junctionForeignKeyName(tableName, sourceFKColumn)}',\n` +
-      `  }).onDelete('cascade'),\n`;
+      `  })${junctionActions},\n`;
     code += `  foreignKey({\n` +
       `    columns: [table.${targetFKColumn}],\n` +
       `    foreignColumns: [${targetModel.name.toLowerCase()}Table.${targetPK.name}],\n` +
       `    name: '${junctionForeignKeyName(tableName, targetFKColumn)}',\n` +
-      `  }).onDelete('cascade'),\n`;
+      `  })${junctionActions},\n`;
 
     // Add indexes for foreign keys
     code += `  index('${junctionIndexName(tableName, sourceFKColumn)}').on(table.${sourceFKColumn}),\n`;

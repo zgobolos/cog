@@ -725,6 +725,7 @@ Deno.test('generator - client errors map to HTTP 400 in the REST layer', async (
 
     // Constraint violations are the request's fault, not the server's
     assertEquals(helpers.includes("'23505': 409"), true);
+    assertEquals(helpers.includes("'23001': 409"), true);
     assertEquals(helpers.includes("'23503': 400"), true);
     // drizzle wraps driver errors, so the SQLSTATE has to be read from the cause
     assertEquals(helpers.includes('(error as { cause?: unknown }).cause ?? error'), true);
@@ -954,5 +955,76 @@ Deno.test('generator - a name at the identifier limit is accepted', async () => 
     assertExists(await Deno.readTextFile(`${LONG_NAME_OUTPUT}/schema/boundary.schema.ts`));
   } finally {
     await cleanupLongName();
+  }
+});
+
+const FK_MODELS = './test/test-fk-models';
+const FK_OUTPUT = './test/test-fk-generated';
+
+async function cleanupForeignKeys() {
+  for (const p of [FK_MODELS, FK_OUTPUT]) {
+    try {
+      await Deno.remove(p, { recursive: true });
+    } catch { /* ignore */ }
+  }
+}
+
+// Regression: a foreign key also says what happens when the parent goes away. The actions used
+// to be accepted by the model and dropped by the generator, leaving every key on NO ACTION.
+Deno.test('generator - foreign keys carry their referential actions', async () => {
+  await cleanupForeignKeys();
+  try {
+    await Deno.mkdir(FK_MODELS, { recursive: true });
+    const tag = {
+      name: 'Tag',
+      tableName: 'tag',
+      fields: [{ name: 'id', type: 'uuid', primaryKey: true, defaultValue: 'gen_random_uuid()', required: true }],
+      relationships: [
+        {
+          type: 'manyToMany',
+          name: 'noteList',
+          target: 'Note',
+          through: 'note_tag',
+          onDelete: 'RESTRICT',
+        },
+      ],
+    };
+    const note = {
+      name: 'Note',
+      tableName: 'note',
+      fields: [
+        { name: 'id', type: 'uuid', primaryKey: true, defaultValue: 'gen_random_uuid()', required: true },
+        { name: 'authorId', type: 'uuid', references: { model: 'Author', field: 'id', onDelete: 'CASCADE' } },
+        {
+          name: 'parentId',
+          type: 'uuid',
+          references: { model: 'Note', field: 'id', onDelete: 'SET NULL', onUpdate: 'CASCADE' },
+        },
+      ],
+    };
+    const author = {
+      name: 'Author',
+      tableName: 'author',
+      fields: [{ name: 'id', type: 'uuid', primaryKey: true, defaultValue: 'gen_random_uuid()', required: true }],
+    };
+    for (const [file, model] of [['tag', tag], ['note', note], ['author', author]] as const) {
+      await Deno.writeTextFile(`${FK_MODELS}/${file}.json`, JSON.stringify(model, null, 2));
+    }
+    await generateFromModels(FK_MODELS, FK_OUTPUT);
+
+    const noteSchema = await Deno.readTextFile(`${FK_OUTPUT}/schema/note.schema.ts`);
+    assertEquals(noteSchema.includes("references(() => authorTable.id, { onDelete: 'cascade' })"), true);
+    // self-references keep the AnyPgColumn hint and take the actions too
+    assertEquals(
+      noteSchema.includes("references((): AnyPgColumn => noteTable.id, { onDelete: 'set null', onUpdate: 'cascade' })"),
+      true,
+    );
+
+    // A junction row is meaningless without both sides, so it cascades unless told otherwise
+    const junctionSchema = await Deno.readTextFile(`${FK_OUTPUT}/schema/note_tag.schema.ts`);
+    assertEquals(junctionSchema.includes(".onDelete('restrict')"), true);
+    assertEquals(junctionSchema.includes(".onDelete('cascade')"), false);
+  } finally {
+    await cleanupForeignKeys();
   }
 });
