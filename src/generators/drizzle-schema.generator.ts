@@ -1,5 +1,11 @@
 import { FieldDefinition, IndexDefinition, ModelDefinition, RelationshipDefinition } from '../types/model.types.ts';
-import { getSoftDeleteColumn, normalizeAccept, normalizeExpose } from '../utils/field.utils.ts';
+import {
+  getSoftDeleteColumn,
+  hasPostGISFields,
+  modelsHavePostGISFields,
+  normalizeAccept,
+  normalizeExpose,
+} from '../utils/field.utils.ts';
 import { capitalize, toSnakeCase } from '../utils/string.utils.ts';
 import { isPostGISType } from '../constants.ts';
 import { SpatialUtilsGenerator } from './spatial-utils.generator.ts';
@@ -46,7 +52,7 @@ export class DrizzleSchemaGenerator {
     }
 
     // Generate spatial utilities if PostGIS is enabled and any model has PostGIS fields
-    if (this.postgis && this.models.some((model) => this.hasPostGISFields(model))) {
+    if (this.postgis && modelsHavePostGISFields(this.models)) {
       const spatialUtilsGenerator = new SpatialUtilsGenerator();
       const spatialUtilsContent = spatialUtilsGenerator.generate();
       schemas.set('schema/spatial-utils.ts', spatialUtilsContent);
@@ -118,7 +124,7 @@ export class DrizzleSchemaGenerator {
     }
 
     // Check if we need customType for PostGIS
-    if (this.postgis && this.hasPostGISFields(model)) {
+    if (this.postgis && hasPostGISFields(model)) {
       drizzleImports.add('customType');
     }
 
@@ -142,7 +148,7 @@ export class DrizzleSchemaGenerator {
     imports += `import type { FieldMeta } from '../utils/field-meta.utils.ts';\n`;
 
     // Import spatial utilities if PostGIS fields exist
-    if (this.postgis && this.hasPostGISFields(model)) {
+    if (this.postgis && hasPostGISFields(model)) {
       imports += `import { geoJsonToWKT, wktToGeoJSON, type GeoJSON } from './spatial-utils.ts';\n`;
     }
 
@@ -1015,13 +1021,6 @@ export class DrizzleSchemaGenerator {
     code += `export * from './relations.ts';\n`;
 
     return code;
-  }
-
-  /**
-   * Check if model has PostGIS fields
-   */
-  private hasPostGISFields(model: ModelDefinition): boolean {
-    return model.fields.some((f) => isPostGISType(f.type));
   }
 
   /**

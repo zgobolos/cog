@@ -21,7 +21,7 @@ export class RestCrudFactoryGenerator {
 import { Hono, type Context } from '@hono/hono';
 import { HTTPException } from '@hono/hono/http-exception';
 import { withTransaction, type DbTransaction } from '../db/database.ts';
-import { convertBigIntToNumber, handleDomainException, parseWhereParam, validateFilter, type FieldMeta } from './helpers.ts';
+import { convertBigIntToNumber, handleDomainException, parseJsonBody, parseWhereParam, validateFilter, type FieldMeta } from './helpers.ts';
 import { type QueryOptions } from '../domain/hooks.types.ts';
 
 // ============================================
@@ -184,7 +184,7 @@ export const createCreateHandler = <T, TNew, RestEnvVars extends Record<string, 
 ) => {
   return async (c: Context<{ Variables: RestEnvVars }>) => {
     try {
-      const body = await c.req.json();
+      const body = await parseJsonBody<TNew>(c);
       const context = c.var as RestEnvVars;
 
       const result = await withTransaction(async (tx) => {
@@ -207,7 +207,7 @@ export const createUpdateHandler = <T, TNew, RestEnvVars extends Record<string, 
   return async (c: Context<{ Variables: RestEnvVars }, '/:id'>) => {
     try {
       const id = c.req.param('id');
-      const body = await c.req.json();
+      const body = await parseJsonBody<Partial<TNew>>(c);
       const context = c.var as RestEnvVars;
 
       const result = await withTransaction(async (tx) => {

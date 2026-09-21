@@ -170,7 +170,7 @@ export interface GeneratorConfig {
   outputPath: string; // Path where generated code will be written
   database: {
     type: 'postgresql' | 'cockroachdb';
-    postgis?: boolean;
+    postgis?: boolean; // PostGIS support: spatial types in the generated code and the extension itself
     schema?: string; // Default schema
   };
   features?: {

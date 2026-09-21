@@ -1,6 +1,7 @@
 #!/usr/bin/env -S deno run --allow-read --allow-write --allow-env
 
 import { generateFromModels } from './mod.ts';
+import { formatDependencyReport } from './utils/dependency.utils.ts';
 import denoJson from '../deno.json' with { type: 'json' };
 
 /**
@@ -11,6 +12,7 @@ interface CliArgs {
   outputPath?: string;
   dbType?: 'postgresql' | 'cockroachdb' | string;
   schema?: string;
+  postgis?: boolean;
   verbose?: boolean;
   help?: boolean;
   version?: boolean;
@@ -30,14 +32,17 @@ async function main() {
   const dbType = (args.dbType || 'postgresql') as 'postgresql' | 'cockroachdb';
 
   // Call the main generation function - it will handle all output based on verbose flag
-  await generateFromModels(modelsPath, outputPath, {
+  const { dependencies } = await generateFromModels(modelsPath, outputPath, {
     database: {
       type: dbType,
-      postgis: true,
+      postgis: args.postgis !== false,
       schema: args.schema,
     },
     verbose,
   });
+
+  // The generator emits no deno.json, so the consuming project has to declare these itself
+  console.log(formatDependencyReport(dependencies));
 }
 
 /**
@@ -91,6 +96,8 @@ Options:
   --outputPath <path>    Path to output directory (default: ./generated)
   --dbType <type>        Database type: postgresql or cockroachdb (default: postgresql)
   --schema <name>        Database schema name
+  --no-postgis           Disable PostGIS entirely: no spatial support in the generated code and
+                         no CREATE EXTENSION postgis. Spatial fields are then a model error.
   --verbose              Output the relative paths of generated files
   --version              Show the COG version
   --help                 Show this help message

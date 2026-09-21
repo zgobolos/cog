@@ -16,7 +16,8 @@ cog/
 │   ├── parser/model-parser.ts              # JSON model validation & parsing
 │   ├── utils/
 │   │   ├── string.utils.ts                 # String utilities (capitalize, toSnakeCase, toCamelCase)
-│   │   └── field.utils.ts                  # Field normalization (normalizeExpose, normalizeAccept)
+│   │   ├── field.utils.ts                  # Field normalization, soft-delete column, PostGIS field detection
+│   │   └── dependency.utils.ts             # Dependency contract of the generated code (scan + report)
 │   └── generators/
 │       ├── drizzle-schema.generator.ts     # Drizzle ORM schemas
 │       ├── database-init.generator.ts      # DB connection & init
@@ -182,6 +183,12 @@ OpenAPI spec is built dynamically from metadata at runtime:
 
 - Date fields: API uses numeric timestamps (e.g., `1704067200000`), stored as `bigint`
 - Spatial fields: API uses GeoJSON, stored as WKT/EWKB
+- `CREATE EXTENSION IF NOT EXISTS postgis` is emitted into `db/initialize-database.ts` **only** when at least one model
+  declares a spatial field (`modelsHavePostGISFields` in `src/utils/field.utils.ts`), so a project without spatial
+  fields initializes on a plain PostgreSQL
+- `postgis: false` (`--no-postgis`) turns PostGIS off completely — no spatial support in the generated code and no
+  extension statement. Declaring a spatial field is then a configuration error: `generateFromModels` throws and names
+  the offending fields instead of downgrading the columns
 - Numeric defaults limited to `Number.MAX_SAFE_INTEGER` (2^53-1)
 
 ## Field Properties
@@ -250,10 +257,24 @@ REST layer (`handleDomainException`) converts these to HTTP status codes.
 | ------------------- | ----------- |
 | `NotFoundException` | 404         |
 | `ZodError`          | 400         |
+| Malformed JSON body | 400         |
 | `DomainException`   | 500         |
 
 `ZodError` → 400 carries the Zod issues array as the message, covering all input validation failures (`minLength`,
 `maxLength`, required, enum, type). Exceptions in hooks trigger transaction rollback.
+
+**Zod error detection is structural, not `instanceof`** (`isZodError` in the generated `rest/helpers.ts`): `drizzle-zod`
+builds the schemas with the `zod/v4` namespace, while the root `zod` export is the v3-classic namespace on zod 3.25.x
+(the package's peer range is `^3.25.0 || ^4.0.0`). An identity check silently fails there and every validation error
+surfaces as a 500 — the guard checks `name === 'ZodError'` plus an `issues` array instead, and the generated code no
+longer imports `zod` at all.
+
+**Request bodies** are read through `parseJsonBody` (generated `rest/helpers.ts`), never `c.req.json()` directly, so a
+malformed body is a 400 instead of an unhandled 500. Call sites pass the expected shape as a type argument
+(`parseJsonBody<TNew>(c)`, `parseJsonBody<{ ids?: string[] }>(c)`).
+
+Not covered (still 500): database constraint violations (unique, not-null, FK, check). Drizzle wraps them in
+`DrizzleQueryError` with the SQLSTATE under `error.cause.code`.
 
 ## Soft Delete
 
@@ -337,8 +358,12 @@ Filters passed via `where` query parameter as base64-encoded JSON.
 ## CLI
 
 ```bash
-deno run -A src/cli.ts --modelsPath ./models --outputPath ./generated [--dbType postgresql|cockroachdb] [--schema name] [--verbose] [--version] [--help]
+deno run -A src/cli.ts --modelsPath ./models --outputPath ./generated [--dbType postgresql|cockroachdb] [--schema name] [--no-postgis] [--verbose] [--version] [--help]
 ```
+
+Every run ends with the dependency report (see Dependencies below): the packages the emitted files actually import,
+grouped into dependencies, dev dependencies and optional. `generateFromModels` returns the same data as `dependencies`,
+so it is available to programmatic callers without parsing stdout.
 
 ## Naming Conventions
 
@@ -354,15 +379,39 @@ deno run -A src/cli.ts --modelsPath ./models --outputPath ./generated [--dbType 
 ```json
 {
   "imports": {
+    "@hono/hono": "jsr:@hono/hono@^4.13.8",
+    "@scalar/hono-api-reference": "npm:@scalar/hono-api-reference@^0.12.2",
     "drizzle-orm": "npm:drizzle-orm@^0.45.2",
     "drizzle-zod": "npm:drizzle-zod@^0.8.3",
-    "@hono/hono": "jsr:@hono/hono@^4.12.26",
+    "openapi-types": "npm:openapi-types@^12.1.3",
     "postgres": "npm:postgres@^3.4.9",
-    "zod": "npm:zod@^4.4.3",
-    "@scalar/hono-api-reference": "npm:@scalar/hono-api-reference@^0.11.4"
+    "zod": "npm:zod@^4.6.5"
   }
 }
 ```
+
+The generator emits no `deno.json` — this list **is** the dependency contract for consuming projects, so a stale entry
+here is not cosmetic: it is the install instruction users copy. Source of truth is `GENERATED_CODE_DEPENDENCIES` /
+`OPTIONAL_GENERATED_CODE_DEPENDENCIES` in `src/constants.ts`; the generator prints the list at the end of every run
+(`resolveDependencies` in `src/utils/dependency.utils.ts` scans the emitted files, so the printed set matches what was
+actually generated), and a generator test asserts that the constant, this block, the README block and
+`example/deno.json` all agree.
+
+Each entry carries a `kind` that drives the grouping in the generator output:
+
+- `runtime` — `@hono/hono`, `drizzle-orm`, `drizzle-zod`, `postgres`, `zod` (type-only in the generated code, but
+  drizzle-zod resolves it as a runtime peer)
+- `types` — `openapi-types`, a type-only import in `rest/openapi.ts`; belongs to dev dependencies where that split
+  exists
+- `optional` — `@scalar/hono-api-reference`, never imported by the generated code, listed as a suggestion for the API
+  docs UI
+
+- `@hono/hono` **4.13.5+** is a security floor (4.12.x advisories: query-parser cache-key confusion, CORS ReDoS,
+  `parseBody()` memory exhaustion)
+- `zod` **4.x** is the tested line; zod 3.25.x also satisfies drizzle-zod's peer range (`^3.25.0 || ^4.0.0`) but then
+  the root `zod` export is the v3-classic namespace while drizzle-zod uses `zod/v4` — see the Exceptions section
+- Bump versions with `deno add <package spec>` or `deno outdated --update --latest --recursive`, never by editing
+  `deno.json` by hand
 
 ---
 

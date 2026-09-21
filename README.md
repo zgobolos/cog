@@ -272,13 +272,25 @@ Filters passed via `where` query parameter as base64-encoded JSON.
 deno run -A src/cli.ts [options]
 ```
 
-| Option                | Description                   | Default       |
-| --------------------- | ----------------------------- | ------------- |
-| `--modelsPath <path>` | Path to JSON models           | `./models`    |
-| `--outputPath <path>` | Output directory              | `./generated` |
-| `--dbType <type>`     | `postgresql` or `cockroachdb` | `postgresql`  |
-| `--schema <name>`     | Database schema               | (default)     |
-| `--verbose`           | Show file paths               | false         |
+| Option                | Description                           | Default       |
+| --------------------- | ------------------------------------- | ------------- |
+| `--modelsPath <path>` | Path to JSON models                   | `./models`    |
+| `--outputPath <path>` | Output directory                      | `./generated` |
+| `--dbType <type>`     | `postgresql` or `cockroachdb`         | `postgresql`  |
+| `--schema <name>`     | Database schema                       | (default)     |
+| `--no-postgis`        | Turn PostGIS off entirely (see below) | PostGIS on    |
+| `--verbose`           | Show file paths                       | false         |
+
+**PostGIS:** `CREATE EXTENSION IF NOT EXISTS postgis` is emitted into `db/initialize-database.ts` only when at least one
+model actually declares a spatial field, so a project without spatial fields initializes on a plain PostgreSQL that has
+no PostGIS installed.
+
+`--no-postgis` turns PostGIS off completely: no spatial support in the generated code and no extension statement. A
+model that declares a spatial field is then a configuration error and generation fails with a message naming the fields
+— the generator does not silently downgrade spatial columns.
+
+**After every run** the generator prints the packages the generated code needs, grouped into dependencies, dev
+dependencies and optional ones — see [Generated Code Dependencies](#generated-code-dependencies).
 
 ---
 
@@ -468,6 +480,14 @@ const employeeDomainWithHooks = new EmployeeDomain({
 Both bounds are emitted as Zod refinements on the generated insert/update schemas, so they are enforced at the API layer
 on **both create and update**. A value outside the bounds throws a `ZodError`, which the REST layer returns as **HTTP
 400** with the validation issues in the response body.
+
+> Zod errors are recognized structurally (`name === 'ZodError'` plus an `issues` array) rather than with `instanceof`.
+> `drizzle-zod` builds the schemas with the `zod/v4` namespace, which is a different class than the root `zod` export on
+> zod 3.25.x — an identity check would silently fail there and turn every validation error into a 500.
+
+A request body that is not valid JSON is also a client error: every generated handler reads the body through
+`parseJsonBody`, which answers **HTTP 400** instead of letting the parse failure surface as a 500. Database constraint
+violations (unique, not-null, foreign key, check) are **not** translated — they still return 500.
 
 - `maxLength` also sets the `varchar` column length for `string` fields; `text` columns stay unbounded but still get the
   Zod `max` check.
@@ -742,15 +762,36 @@ Add to your `deno.json`:
 ```json
 {
   "imports": {
-    "drizzle-orm": "npm:drizzle-orm@^0.44.5",
-    "drizzle-zod": "npm:drizzle-zod@^0.8.0",
-    "@hono/hono": "jsr:@hono/hono@^4.6.0",
-    "postgres": "npm:postgres@^3.4.7",
-    "zod": "npm:zod@^3.23.0",
-    "@scalar/hono-api-reference": "npm:@scalar/hono-api-reference@^0.5.0"
+    "@hono/hono": "jsr:@hono/hono@^4.13.8",
+    "@scalar/hono-api-reference": "npm:@scalar/hono-api-reference@^0.12.2",
+    "drizzle-orm": "npm:drizzle-orm@^0.45.2",
+    "drizzle-zod": "npm:drizzle-zod@^0.8.3",
+    "openapi-types": "npm:openapi-types@^12.1.3",
+    "postgres": "npm:postgres@^3.4.9",
+    "zod": "npm:zod@^4.6.5"
   }
 }
 ```
+
+The generator prints this same list at the end of every run, resolved from the files it actually emitted. These are the
+versions `example/deno.json` is built and tested against, and a generator test keeps the two in sync.
+
+The generator groups them for a project that separates dependencies from dev dependencies (in Deno they all go into the
+same `imports`):
+
+- **Dependencies** — `@hono/hono`, `drizzle-orm`, `drizzle-zod`, `postgres`, `zod`. `zod` appears only as a type import
+  in the generated code, but `drizzle-zod` resolves it as a runtime peer.
+- **Dev dependencies** — `openapi-types`, imported as a type by `rest/openapi.ts` and never present at runtime.
+- **Optional** — `@scalar/hono-api-reference`, never imported by the generated code; only needed if the application
+  serves the API documentation UI.
+
+- **`@hono/hono` 4.13.5+** is a security floor: 4.12.x is affected by advisories that were fixed in 4.12.27, 4.12.34 and
+  4.13.5 (query-parser cache-key confusion, CORS middleware ReDoS, `parseBody()` memory exhaustion, and JSX/SSR issues
+  that do not apply to a JSON API).
+- **`zod` 4.x** is the tested line. `drizzle-zod` builds the schemas with the `zod/v4` namespace and accepts
+  `^3.25.0 || ^4.0.0` as a peer, so zod 3.25.x also resolves — but then the root `zod` export is the v3-classic
+  namespace, and anything comparing error classes across the two namespaces breaks. The generated code does not rely on
+  `instanceof` for this reason, but staying on zod 4 keeps one single namespace in the project.
 
 ---
 

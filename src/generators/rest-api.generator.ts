@@ -53,7 +53,7 @@ import { registerCrudRoutes, type CrudConfig } from './crud.factory.ts';`;
     if (hasRelationshipEndpoints) {
       imports += `
 import { withTransaction } from '../db/database.ts';
-import { convertBigIntToNumber, handleDomainException } from './helpers.ts';`;
+import { convertBigIntToNumber, handleDomainException, parseJsonBody } from './helpers.ts';`;
     }
 
     return `${imports}
@@ -148,7 +148,7 @@ export type DefaultEnv = {
    */
   private generateRestHelpers(): string {
     return `import { HTTPException } from '@hono/hono/http-exception';
-import { ZodError } from 'zod';
+import type { Context } from '@hono/hono';
 import { NotFoundException, DomainException } from '../domain/exceptions.ts';
 
 // Re-export filter utilities for use in REST handlers
@@ -189,6 +189,31 @@ export function convertBigIntToNumber<T>(obj: T): T {
 }
 
 /**
+ * Detects Zod validation failures structurally instead of with instanceof.
+ * drizzle-zod builds the schemas with the 'zod/v4' namespace, which is a different
+ * class than the root 'zod' export on zod 3.25.x, so an identity check silently fails
+ * depending on how the consuming project resolves zod - and the validation error
+ * would surface as a 500 instead of a 400.
+ */
+const isZodError = (error: unknown): error is { issues: unknown[] } => {
+  return typeof error === 'object' && error !== null &&
+    (error as { name?: string }).name === 'ZodError' &&
+    Array.isArray((error as { issues?: unknown }).issues);
+};
+
+/**
+ * Reads and parses the JSON request body.
+ * A malformed body is a client error, so it must not surface as a 500.
+ */
+export const parseJsonBody = async <T = Record<string, unknown>>(c: Context): Promise<T> => {
+  try {
+    return await c.req.json() as T;
+  } catch {
+    throw new HTTPException(400, { message: 'Invalid JSON in request body' });
+  }
+};
+
+/**
  * Converts domain exceptions to HTTP exceptions
  * Handles centralized error conversion from domain layer
  */
@@ -200,7 +225,7 @@ export function handleDomainException(error: unknown): never {
     throw new HTTPException(500, { message: error.message });
   }
   // Zod validation failures (e.g. minLength/maxLength, required, enum) are client errors
-  if (error instanceof ZodError) {
+  if (isZodError(error)) {
     throw new HTTPException(400, { message: JSON.stringify(error.issues) });
   }
   throw error; // Re-throw unknown errors
@@ -260,7 +285,7 @@ export function handleDomainException(error: unknown): never {
     this.routes.post('/:id/${relName}', async (c) => {
       try {
         const id = c.req.param('id');
-        const body = await c.req.json();
+        const body = await parseJsonBody<{ ids?: string[] }>(c);
         const ids = body.ids || [];
 
         await withTransaction(async (tx) => {
@@ -282,7 +307,7 @@ export function handleDomainException(error: unknown): never {
     this.routes.post('/:id/${singularRelName}', async (c) => {
       try {
         const id = c.req.param('id');
-        const body = await c.req.json();
+        const body = await parseJsonBody<{ id: string }>(c);
         const relatedId = body.id;
 
         await withTransaction(async (tx) => {
@@ -306,7 +331,7 @@ export function handleDomainException(error: unknown): never {
     this.routes.put('/:id/${relName}', async (c) => {
       try {
         const id = c.req.param('id');
-        const body = await c.req.json();
+        const body = await parseJsonBody<{ ids?: string[] }>(c);
         const ids = body.ids || [];
 
         await withTransaction(async (tx) => {
@@ -330,7 +355,7 @@ export function handleDomainException(error: unknown): never {
     this.routes.delete('/:id/${singularRelName}', async (c) => {
       try {
         const id = c.req.param('id');
-        const body = await c.req.json();
+        const body = await parseJsonBody<{ id: string }>(c);
         const relatedId = body.id;
 
         await withTransaction(async (tx) => {
@@ -352,7 +377,7 @@ export function handleDomainException(error: unknown): never {
     this.routes.delete('/:id/${relName}', async (c) => {
       try {
         const id = c.req.param('id');
-        const body = await c.req.json();
+        const body = await parseJsonBody<{ ids?: string[] }>(c);
         const ids = body.ids || [];
 
         await withTransaction(async (tx) => {

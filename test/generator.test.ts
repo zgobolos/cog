@@ -2,8 +2,9 @@
  * Basic generator tests for CI pipeline
  */
 
-import { assertEquals, assertExists } from '@std/assert';
+import { assertEquals, assertExists, assertRejects } from '@std/assert';
 import { generateFromModels } from '../src/mod.ts';
+import { GENERATED_CODE_DEPENDENCIES } from '../src/constants.ts';
 
 const TEST_OUTPUT_PATH = './test/test-generated';
 const TEST_MODELS_PATH = './test/test-models';
@@ -594,5 +595,209 @@ Deno.test('generator - schema "public" uses pgTable, non-public uses pgSchema', 
     );
   } finally {
     await cleanupSchemaTest();
+  }
+});
+
+const PG_MODELS = './test/test-postgis-models';
+const PG_OUTPUT = './test/test-postgis-generated';
+
+async function cleanupPostGIS() {
+  for (const p of [PG_MODELS, PG_OUTPUT]) {
+    try {
+      await Deno.remove(p, { recursive: true });
+    } catch { /* ignore */ }
+  }
+}
+
+async function writePostGISModels(withSpatialField: boolean) {
+  await Deno.mkdir(PG_MODELS, { recursive: true });
+  const model = {
+    name: 'PlainEntity',
+    tableName: 'plain_entity',
+    fields: [
+      { name: 'id', type: 'uuid', primaryKey: true, defaultValue: 'gen_random_uuid()', required: true },
+      { name: 'name', type: 'string', maxLength: 100, required: true },
+      ...(withSpatialField ? [{ name: 'location', type: 'point', srid: 4326 }] : []),
+    ],
+  };
+  await Deno.writeTextFile(`${PG_MODELS}/plain-entity.json`, JSON.stringify(model, null, 2));
+}
+
+Deno.test('generator - no PostGIS extension without spatial fields', async () => {
+  await cleanupPostGIS();
+  try {
+    await writePostGISModels(false);
+    await generateFromModels(PG_MODELS, PG_OUTPUT);
+
+    const init = await Deno.readTextFile(`${PG_OUTPUT}/db/initialize-database.ts`);
+    // CREATE EXTENSION fails on a plain PostgreSQL without PostGIS installed
+    assertEquals(init.includes('CREATE EXTENSION'), false);
+    assertEquals(init.toLowerCase().includes('postgis'), false);
+
+    // spatial utilities must not be emitted either
+    let spatialUtilsExists = true;
+    try {
+      await Deno.stat(`${PG_OUTPUT}/schema/spatial-utils.ts`);
+    } catch {
+      spatialUtilsExists = false;
+    }
+    assertEquals(spatialUtilsExists, false);
+  } finally {
+    await cleanupPostGIS();
+  }
+});
+
+Deno.test('generator - PostGIS extension is created when a model has a spatial field', async () => {
+  await cleanupPostGIS();
+  try {
+    await writePostGISModels(true);
+    await generateFromModels(PG_MODELS, PG_OUTPUT);
+
+    const init = await Deno.readTextFile(`${PG_OUTPUT}/db/initialize-database.ts`);
+    assertEquals(init.includes('CREATE EXTENSION IF NOT EXISTS postgis'), true);
+    assertExists(await Deno.readTextFile(`${PG_OUTPUT}/schema/spatial-utils.ts`));
+  } finally {
+    await cleanupPostGIS();
+  }
+});
+
+Deno.test('generator - postgis: false rejects models with spatial fields', async () => {
+  await cleanupPostGIS();
+  try {
+    await writePostGISModels(true);
+    // Disabling PostGIS omits both the generated spatial support and the extension,
+    // so a spatial field has no valid representation left
+    await assertRejects(
+      () => generateFromModels(PG_MODELS, PG_OUTPUT, { database: { type: 'postgresql', postgis: false } }),
+      Error,
+      'PostGIS is disabled but spatial fields are declared',
+    );
+  } finally {
+    await cleanupPostGIS();
+  }
+});
+
+Deno.test('generator - postgis: false generates normally without spatial fields', async () => {
+  await cleanupPostGIS();
+  try {
+    await writePostGISModels(false);
+    await generateFromModels(PG_MODELS, PG_OUTPUT, { database: { type: 'postgresql', postgis: false } });
+
+    const init = await Deno.readTextFile(`${PG_OUTPUT}/db/initialize-database.ts`);
+    assertEquals(init.includes('CREATE EXTENSION'), false);
+    assertEquals(init.includes('"plain_entity"'), true);
+  } finally {
+    await cleanupPostGIS();
+  }
+});
+
+Deno.test('generator - client errors map to HTTP 400 in the REST layer', async () => {
+  await cleanupPostGIS();
+  try {
+    await writePostGISModels(false);
+    await generateFromModels(PG_MODELS, PG_OUTPUT);
+
+    const helpers = await Deno.readTextFile(`${PG_OUTPUT}/rest/helpers.ts`);
+
+    // Zod errors are detected structurally: instanceof breaks when the consuming project
+    // resolves the root 'zod' namespace while drizzle-zod builds schemas with 'zod/v4'
+    assertEquals(helpers.includes("from 'zod'"), false);
+    assertEquals(/const isZodError\s*=\s*\(error: unknown\)/.test(helpers), true);
+    assertEquals(helpers.includes("=== 'ZodError'"), true);
+    assertEquals(/if \(isZodError\(error\)\) \{\s*\n\s*throw new HTTPException\(400/.test(helpers), true);
+
+    // A malformed JSON body is a client error, not a 500
+    assertEquals(/export const parseJsonBody\s*=\s*async </.test(helpers), true);
+    assertEquals(helpers.includes("throw new HTTPException(400, { message: 'Invalid JSON in request body' })"), true);
+
+    // Handlers must go through parseJsonBody instead of c.req.json()
+    const factory = await Deno.readTextFile(`${PG_OUTPUT}/rest/crud.factory.ts`);
+    assertEquals(factory.includes('c.req.json()'), false);
+    assertEquals(factory.includes('await parseJsonBody<TNew>(c)'), true);
+    assertEquals(factory.includes('await parseJsonBody<Partial<TNew>>(c)'), true);
+  } finally {
+    await cleanupPostGIS();
+  }
+});
+
+const DEP_MODELS = './test/test-dep-models';
+const DEP_OUTPUT = './test/test-dep-generated';
+
+async function cleanupDependencies() {
+  for (const p of [DEP_MODELS, DEP_OUTPUT]) {
+    try {
+      await Deno.remove(p, { recursive: true });
+    } catch { /* ignore */ }
+  }
+}
+
+/**
+ * Reads the first ```json import map block that follows a markdown heading
+ */
+async function readImportMapBlock(path: string, heading: string): Promise<Record<string, string>> {
+  const content = await Deno.readTextFile(path);
+  const headingIndex = content.indexOf(heading);
+  assertEquals(headingIndex >= 0, true, `${path} must contain the heading "${heading}"`);
+
+  const section = content.slice(headingIndex);
+  const fenceStart = section.indexOf('```json');
+  assertEquals(fenceStart >= 0, true, `${path} must contain a json block under "${heading}"`);
+
+  const bodyStart = fenceStart + '```json'.length;
+  const fenceEnd = section.indexOf('```', bodyStart);
+  const parsed = JSON.parse(section.slice(bodyStart, fenceEnd)) as { imports: Record<string, string> };
+  return parsed.imports;
+}
+
+Deno.test('generator - reports the dependencies the generated code imports', async () => {
+  await cleanupDependencies();
+  try {
+    await Deno.mkdir(DEP_MODELS, { recursive: true });
+    const model = {
+      name: 'DepEntity',
+      tableName: 'dep_entity',
+      fields: [
+        { name: 'id', type: 'uuid', primaryKey: true, defaultValue: 'gen_random_uuid()', required: true },
+        { name: 'name', type: 'string', maxLength: 100, required: true },
+      ],
+    };
+    await Deno.writeTextFile(`${DEP_MODELS}/dep-entity.json`, JSON.stringify(model, null, 2));
+
+    const { dependencies } = await generateFromModels(DEP_MODELS, DEP_OUTPUT);
+
+    // Every package the generated files import must have a known version
+    assertEquals(dependencies.unresolved, []);
+    // The set is scanned from the emitted files, sorted by package name
+    assertEquals(Object.keys(dependencies.runtime), [
+      '@hono/hono',
+      'drizzle-orm',
+      'drizzle-zod',
+      'postgres',
+      'zod',
+    ]);
+    // openapi-types is only ever imported as a type
+    assertEquals(Object.keys(dependencies.types), ['openapi-types']);
+    // Scalar is never imported by the generated code - it stays an optional suggestion
+    assertEquals(Object.keys(dependencies.optional), ['@scalar/hono-api-reference']);
+  } finally {
+    await cleanupDependencies();
+  }
+});
+
+Deno.test('generator - dependency contract is in sync across docs and example', async () => {
+  // The generator emits no deno.json, so the same contract is duplicated in the docs.
+  // This is the drift guard: all four copies must agree.
+  const expected = Object.fromEntries(
+    Object.entries(GENERATED_CODE_DEPENDENCIES).map(([name, dependency]) => [name, dependency.specifier]),
+  );
+
+  assertEquals(await readImportMapBlock('README.md', '### Generated Code Dependencies'), expected);
+  assertEquals(await readImportMapBlock('AGENTS.md', '## Dependencies (Generated Code)'), expected);
+
+  const exampleConfig = JSON.parse(await Deno.readTextFile('example/deno.json')) as {
+    imports: Record<string, string>;
+  };
+  for (const [name, specifier] of Object.entries(expected)) {
+    assertEquals(exampleConfig.imports[name], specifier, `example/deno.json must pin ${name} as ${specifier}`);
   }
 });

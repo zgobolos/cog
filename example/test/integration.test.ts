@@ -1042,6 +1042,27 @@ async function runTests(): Promise<void> {
   createdIds.acceptanceTestEntities.push(boundaryEntity.id);
   logSuccess('✓ minLength validation: too-short rejected (400) on create/update, boundary value accepted');
 
+  // 15.8 Malformed JSON body is a client error, not a server error
+  logStep('15.8 POST with malformed JSON body - verify rejected (400)');
+  const malformedBody = await fetch(`${BASE_URL}/api/acceptancetestentity`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{ "normalField": ',
+  });
+  await malformedBody.text();
+  assertEquals(malformedBody.status, 400, 'POST with a malformed JSON body should return HTTP 400');
+
+  // 15.9 The same on update
+  logStep('15.9 PUT with malformed JSON body - verify rejected (400)');
+  const malformedUpdate = await fetch(`${BASE_URL}/api/acceptancetestentity/${boundaryEntity.id}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: 'not json at all',
+  });
+  await malformedUpdate.text();
+  assertEquals(malformedUpdate.status, 400, 'PUT with a malformed JSON body should return HTTP 400');
+  logSuccess('✓ Malformed JSON body rejected with 400 on create and update');
+
   logSuccess('All field acceptance tests passed!');
 
   // ========================================

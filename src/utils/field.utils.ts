@@ -3,6 +3,7 @@
  */
 
 import { AcceptType, ExposeType, ModelDefinition } from '../types/model.types.ts';
+import { isPostGISType } from '../constants.ts';
 
 /**
  * Normalize expose config to a consistent object format
@@ -44,4 +45,20 @@ export const getSoftDeleteColumn = (model: ModelDefinition): string | null => {
   if (!model.softDelete) return null;
   if (model.softDelete === true) return 'deleted_at';
   return model.softDelete.deletedAt ?? 'deleted_at';
+};
+
+/**
+ * Returns true when the model has at least one PostGIS (spatial) field.
+ */
+export const hasPostGISFields = (model: ModelDefinition): boolean => {
+  return model.fields.some((f) => isPostGISType(f.type));
+};
+
+/**
+ * Returns true when at least one of the models has a PostGIS (spatial) field.
+ * Spatial-only artifacts (the PostGIS extension, the spatial utilities module) must
+ * not be emitted for a model set that has no spatial field at all.
+ */
+export const modelsHavePostGISFields = (models: ModelDefinition[]): boolean => {
+  return models.some(hasPostGISFields);
 };

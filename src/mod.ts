@@ -16,6 +16,8 @@ import { JunctionUtilsGenerator } from './generators/junction-utils.generator.ts
 import { FieldMetaUtilsGenerator } from './generators/field-meta-utils.generator.ts';
 import { BaseDomainGenerator } from './generators/base-domain.generator.ts';
 import { GeneratorConfig, ModelDefinition } from './types/model.types.ts';
+import { type DependencyReport, resolveDependencies } from './utils/dependency.utils.ts';
+import { isPostGISType } from './constants.ts';
 
 export * from './types/model.types.ts';
 
@@ -62,6 +64,20 @@ export async function generateFromModels(
 
     if (hasErrors) {
       throw new Error('Generation aborted due to validation errors');
+    }
+  }
+
+  // With PostGIS disabled the generated code has no spatial support at all, so a spatial field
+  // is a configuration error rather than something to silently downgrade
+  if (!config.database.postgis) {
+    const spatialFields = models.flatMap((model) =>
+      model.fields.filter((field) => isPostGISType(field.type)).map((field) => `${model.name}.${field.name}`)
+    );
+    if (spatialFields.length > 0) {
+      throw new Error(
+        `PostGIS is disabled but spatial fields are declared: ${spatialFields.join(', ')}. ` +
+          'Enable PostGIS or remove these fields.',
+      );
     }
   }
 
@@ -150,10 +166,14 @@ export async function generateFromModels(
   // Step 3: Write files
   await writeGeneratedFiles(outputPath, files, verbose);
 
+  // Step 4: Report the dependency contract of what was just generated
+  const dependencies: DependencyReport = resolveDependencies(files);
+
   return {
     models,
     fileCount: files.size,
     outputPath,
+    dependencies,
   };
 }
 

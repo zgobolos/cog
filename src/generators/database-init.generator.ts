@@ -1,5 +1,5 @@
 import { FieldDefinition, ModelDefinition } from '../types/model.types.ts';
-import { getSoftDeleteColumn } from '../utils/field.utils.ts';
+import { getSoftDeleteColumn, modelsHavePostGISFields } from '../utils/field.utils.ts';
 import { toSnakeCase } from '../utils/string.utils.ts';
 
 /**
@@ -8,7 +8,10 @@ import { toSnakeCase } from '../utils/string.utils.ts';
 export class DatabaseInitGenerator {
   private models: ModelDefinition[];
   private dbType: 'postgresql' | 'cockroachdb';
+  /** PostGIS support: drives spatial column types and GIST index methods */
   private postgis: boolean;
+  /** Whether the initialization script has to create the PostGIS extension */
+  private requiresPostGISExtension: boolean;
 
   constructor(
     models: ModelDefinition[],
@@ -17,13 +20,16 @@ export class DatabaseInitGenerator {
     this.models = models;
     this.dbType = options.dbType === 'cockroachdb' ? 'cockroachdb' : 'postgresql';
     this.postgis = options.postgis !== false;
+    // The extension is only required when a model actually declares a spatial field,
+    // otherwise CREATE EXTENSION fails on a plain PostgreSQL without PostGIS installed
+    this.requiresPostGISExtension = this.postgis && modelsHavePostGISFields(models);
   }
 
   /**
    * Generate database initialization script
    */
   generateDatabaseInitialization(): string {
-    const createPostgis = this.postgis
+    const createPostgis = this.requiresPostGISExtension
       ? "\n    // Create PostGIS extension\n    await sql`CREATE EXTENSION IF NOT EXISTS postgis`;\n    logger.info?.('PostGIS extension created');"
       : '';
 
