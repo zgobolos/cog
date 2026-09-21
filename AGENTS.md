@@ -38,7 +38,7 @@ cog/
 │   ├── generated/                          # Example generated code
 │   ├── src/main.ts                         # Example server entry point
 │   ├── test/integration.test.ts            # Integration tests
-│   ├── db-init.ts                          # Database initialization script
+│   ├── db-bootstrap.ts                     # Database bootstrap (PostGIS extension)
 │   └── db-clean.ts                         # Database cleanup script
 ├── .github/
 │   ├── workflows/ci.yml                    # CI pipeline (lint, check, test, coverage)
@@ -69,7 +69,10 @@ cog/
 | ------------------- | ------------------------- |
 | `cog:psql:generate` | Generate for PostgreSQL   |
 | `cog:crdb:generate` | Generate for CockroachDB  |
-| `db:init`           | Initialize database       |
+| `db:bootstrap`      | Prepare extensions        |
+| `drizzle:push`      | Sync schema (dev/test)    |
+| `drizzle:generate`  | Create a migration        |
+| `drizzle:migrate`   | Apply migrations          |
 | `db:clean`          | Clean database            |
 | `fmt` / `fmt:check` | Format / check formatting |
 | `lint` / `check`    | Lint / type check         |
@@ -80,9 +83,10 @@ cog/
 ```
 generated/
 ├── index.ts                    # initializeGenerated() entry point
+├── drizzle.config.ts           # drizzle-kit config (schema path, filters, credentials)
 ├── db/
 │   ├── database.ts             # Connection pooling, transactions
-│   └── initialize-database.ts  # Table creation, PostGIS setup
+│   └── bootstrap.ts            # PostGIS extension (PostgreSQL only)
 ├── schema/
 │   ├── [model].schema.ts       # Drizzle tables + Zod schemas
 │   ├── spatial-utils.ts        # GeoJSON <-> WKT conversion
@@ -104,6 +108,41 @@ generated/
     ├── types.ts                # Shared REST types
     └── helpers.ts              # Shared REST helpers
 ```
+
+## Database Lifecycle
+
+COG generates **no DDL**. The generated Drizzle schema is the single source of truth and drizzle-kit turns it into
+tables, so one description produces one database and there is a real migration path.
+
+**Two vocabularies, one word.** `cog:*:generate` produces the _current_ schema from the models and never migration
+material. `drizzle-kit generate` diffs that schema against its own snapshot history and writes migration SQL. The
+example tasks keep them apart: `cog:psql:generate` / `cog:crdb:generate` are COG's, `drizzle:push`, `drizzle:generate`
+and `drizzle:migrate` are drizzle-kit's. The generated output is a plain Drizzle schema and a plain `drizzle.config.ts`,
+so everything in the drizzle-kit documentation applies to it unchanged.
+
+| Step        | Command                                   | When                                                           |
+| ----------- | ----------------------------------------- | -------------------------------------------------------------- |
+| Bootstrap   | `db:bootstrap`                            | Before the first push/migrate. Installs the PostGIS extension. |
+| Development | `drizzle:push`                            | Syncs the database to the schema, no migration files.          |
+| Production  | `drizzle:generate` then `drizzle:migrate` | Versioned migration files, committed to the repository.        |
+
+**The two paths are exclusive per database.** `push` writes no migration history, so a pushed database cannot be
+migrated later: the first `generate` emits a full `CREATE TABLE` baseline and `migrate` fails against the tables that
+already exist. `db/bootstrap.ts` is runnable on its own (`deno run -A --env-file=.env <generated>/db/bootstrap.ts`), so
+a consuming project needs no wrapper script.
+
+- The `pgSchema()` instance of a non-default schema is **exported** on purpose: drizzle-kit discovers declared schemas
+  through the module's exports and creates them. A non-exported instance makes it try to _drop_ the schema.
+- `drizzle.config.ts` carries `schemaFilter` for every schema the models use, and `extensionsFilters: ['postgis']` when
+  spatial fields exist - otherwise push offers to drop `spatial_ref_sys`, PostGIS' own table.
+- Credentials come from `process.env.DB_URL`: drizzle-kit loads its config with its own loader, not Deno's dotenv, so
+  the tasks pass `--env-file`.
+- Junction table constraints are named explicitly. drizzle derives names by concatenating both sides, which for a
+  junction table exceeds the 63 byte identifier limit and collides with the primary key's name after truncation.
+- The same schema serves both databases: CockroachDB accepts `USING GIST` and `USING GIN` (mapped onto its inverted
+  indexes) and has native `GEOMETRY`/`GEOGRAPHY`.
+- A `geography` column is emitted without a type modifier. drizzle-kit renders any type it does not know natively as a
+  quoted identifier, and `"geography(Point,4326)"` is not a type - plain `"geography"` is.
 
 ## Architecture Patterns
 
@@ -191,9 +230,10 @@ definition.
 
 - Date fields: API uses numeric timestamps (e.g., `1704067200000`), stored as `bigint`
 - Spatial fields: API uses GeoJSON, stored as WKT/EWKB
-- `CREATE EXTENSION IF NOT EXISTS postgis` is emitted into `db/initialize-database.ts` **only** when at least one model
-  declares a spatial field (`modelsHavePostGISFields` in `src/utils/field.utils.ts`), so a project without spatial
-  fields initializes on a plain PostgreSQL
+- `CREATE EXTENSION IF NOT EXISTS postgis` is emitted into `db/bootstrap.ts` **only** for PostgreSQL and only when at
+  least one model declares a spatial field, so a project without spatial fields initializes on a plain PostgreSQL.
+  CockroachDB has spatial support built in and does not implement `CREATE EXTENSION`, so it never gets the statement;
+  `GEOGRAPHY` is a native, indexable type there as well
 - `postgis: false` (`--no-postgis`) turns PostGIS off completely — no spatial support in the generated code and no
   extension statement. Declaring a spatial field is then a configuration error: `generateFromModels` throws and names
   the offending fields instead of downgrading the columns
@@ -261,12 +301,14 @@ Same pattern for `Update`, `Delete`, `FindById`, `FindMany`, and junction operat
 Domain layer throws `DomainException` or `NotFoundException`. Zod validation (input schema parse) throws `ZodError`.
 REST layer (`handleDomainException`) converts these to HTTP status codes.
 
-| Exception           | HTTP Status |
-| ------------------- | ----------- |
-| `NotFoundException` | 404         |
-| `ZodError`          | 400         |
-| Malformed JSON body | 400         |
-| `DomainException`   | 500         |
+| Exception               | HTTP Status |
+| ----------------------- | ----------- |
+| `NotFoundException`     | 404         |
+| `ZodError`              | 400         |
+| Malformed JSON body     | 400         |
+| Unique violation        | 409         |
+| Other constraint errors | 400         |
+| `DomainException`       | 500         |
 
 `ZodError` → 400 carries the Zod issues array as the message, covering all input validation failures (`minLength`,
 `maxLength`, required, enum, type). Exceptions in hooks trigger transaction rollback.
@@ -281,8 +323,20 @@ longer imports `zod` at all.
 malformed body is a 400 instead of an unhandled 500. Call sites pass the expected shape as a type argument
 (`parseJsonBody<TNew>(c)`, `parseJsonBody<{ ids?: string[] }>(c)`).
 
-Not covered (still 500): database constraint violations (unique, not-null, FK, check). Drizzle wraps them in
-`DrizzleQueryError` with the SQLSTATE under `error.cause.code`.
+**Database constraint violations** are mapped by SQLSTATE, because the request caused them:
+
+| SQLSTATE          | Condition             | HTTP |
+| ----------------- | --------------------- | ---- |
+| `23505`           | unique violation      | 409  |
+| `23502`           | not-null violation    | 400  |
+| `23503`           | foreign key violation | 400  |
+| `23514`           | check violation       | 400  |
+| `22001`           | value too long        | 400  |
+| `22007` / `22P02` | invalid format        | 400  |
+
+The response message names the violated constraint when the driver reports one. Drizzle wraps driver errors in a
+`DrizzleQueryError`, so the code is read from `error.cause` first, falling back to the error itself. Any other SQLSTATE
+stays a 500: that is an outage or a bug, not a client mistake.
 
 ## Soft Delete
 
@@ -389,6 +443,7 @@ so it is available to programmatic callers without parsing stdout.
   "imports": {
     "@hono/hono": "jsr:@hono/hono@^4.13.8",
     "@scalar/hono-api-reference": "npm:@scalar/hono-api-reference@^0.12.2",
+    "drizzle-kit": "npm:drizzle-kit@^0.31.10",
     "drizzle-orm": "npm:drizzle-orm@^0.45.2",
     "drizzle-zod": "npm:drizzle-zod@^0.8.3",
     "openapi-types": "npm:openapi-types@^12.1.3",
@@ -476,7 +531,9 @@ Should any of the deno tasks fail, fix the errors before continuing the restart 
 
 - `deno task cog:crdb:generate`, ask the developer to run it
 - `deno task cog:psql:generate`, ask the developer to run it
-- `deno task db:init`, ask the developer to run it
+- `deno task drizzle:push`, ask the developer to run it
+- `deno task drizzle:migrate`, ask the developer to run it
+- `deno task db:bootstrap`, ask the developer to run it
 - `deno task db:clean`, ask the developer to run it
 - `deno task test`, ask the developer to run it
 - `deno task test:integration`, ask the developer to run it

@@ -5,9 +5,7 @@ import postgres from 'postgres';
 const env = await load();
 
 const sql = postgres(env.DB_URL, {
-  ssl: {
-    ca: Deno.readTextFileSync(join(Deno.cwd(), env.DB_SSL_CA_FILE)),
-  },
+  ssl: env.DB_SSL_CA_FILE ? { ca: Deno.readTextFileSync(join(Deno.cwd(), env.DB_SSL_CA_FILE)) } : undefined,
 });
 
 console.log('Cleaning all tables...');

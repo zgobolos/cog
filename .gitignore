@@ -5,3 +5,5 @@ generated
 cov/
 lcov.info
 .cog-agent-plan.md
+# The example regenerates its schema; its migration history is an artifact, not history
+example/drizzle/

@@ -7,6 +7,19 @@ import {
   ValidationError,
 } from '../types/model.types.ts';
 import { isPostGISType } from '../constants.ts';
+import {
+  checkConstraintName,
+  columnName,
+  fieldIndexName,
+  fieldUniqueIndexName,
+  identifierLength,
+  isIdentifierTooLong,
+  junctionForeignKeyName,
+  junctionIndexName,
+  junctionPrimaryKeyName,
+  MAX_IDENTIFIER_LENGTH,
+  modelIndexName,
+} from '../utils/identifier.utils.ts';
 
 /**
  * Parser for reading and validating model definitions from JSON files
@@ -176,7 +189,63 @@ export class ModelParser {
       endpoints: modelData.endpoints as ModelDefinition['endpoints'],
     };
 
+    this.validateIdentifierLengths(model);
+
     return model;
+  }
+
+  /**
+   * Reject anything the database would truncate.
+   *
+   * PostgreSQL silently shortens identifiers longer than 63 bytes, which breaks the schema
+   * rather than degrading it: the ORM keeps querying the full name, and two derived names can
+   * collide once truncated. This checks both the names the developer writes and the ones COG
+   * derives from them, and fails the generation instead.
+   */
+  private validateIdentifierLengths(model: ModelDefinition): void {
+    const report = (identifier: string, description: string) => {
+      if (!isIdentifierTooLong(identifier)) return;
+      this.errors.push({
+        model: model.name,
+        message: `${description} '${identifier}' is ${identifierLength(identifier)} bytes, ` +
+          `over the ${MAX_IDENTIFIER_LENGTH} byte database limit - shorten the model, table, ` +
+          `field or index name it is derived from`,
+        severity: 'error',
+      });
+    };
+
+    report(model.tableName, 'Table name');
+
+    for (const field of model.fields) {
+      report(columnName(field.name), `Column name of '${field.name}'`);
+      if (field.index) report(fieldIndexName(model, field.name), 'Index name');
+      if (field.unique && model.softDelete) {
+        report(fieldUniqueIndexName(model, field.name), 'Unique index name');
+      }
+    }
+
+    for (const index of model.indexes ?? []) {
+      report(index.name || modelIndexName(model, index.fields), 'Index name');
+    }
+
+    for (let i = 0; i < (model.check?.numNotNulls?.length ?? 0); i++) {
+      report(checkConstraintName(model, i), 'Check constraint name');
+    }
+
+    for (const relationship of model.relationships ?? []) {
+      if (relationship.type !== 'manyToMany' || !relationship.through) continue;
+
+      const junction = relationship.through;
+      const sourceColumn = relationship.foreignKey || `${columnName(model.name)}_id`;
+      const targetColumn = relationship.targetForeignKey || `${columnName(relationship.target)}_id`;
+
+      report(junction, 'Junction table name');
+      report(junctionPrimaryKeyName(junction), 'Junction primary key name');
+      for (const column of [sourceColumn, targetColumn]) {
+        report(junctionForeignKeyName(junction, column), 'Junction foreign key name');
+        report(junctionIndexName(junction, column), 'Junction index name');
+      }
+    }
   }
 
   /**

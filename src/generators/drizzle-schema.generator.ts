@@ -1,5 +1,14 @@
 import { FieldDefinition, IndexDefinition, ModelDefinition, RelationshipDefinition } from '../types/model.types.ts';
 import {
+  checkConstraintName,
+  fieldIndexName,
+  fieldUniqueIndexName,
+  junctionForeignKeyName,
+  junctionIndexName,
+  junctionPrimaryKeyName,
+  modelIndexName,
+} from '../utils/identifier.utils.ts';
+import {
   getCustomSchema,
   getSoftDeleteColumn,
   hasPostGISFields,
@@ -227,6 +236,18 @@ export class DrizzleSchemaGenerator {
   }
 
   /**
+   * Index method for a column, or null for the default (btree).
+   * GiST for spatial and GIN for JSON are accepted by both PostgreSQL and CockroachDB -
+   * CockroachDB maps both onto its inverted indexes.
+   */
+  private indexMethod(field?: FieldDefinition): string | null {
+    if (!field) return null;
+    if (isPostGISType(field.type)) return 'gist';
+    if (field.type === 'json' || field.type === 'jsonb') return 'gin';
+    return null;
+  }
+
+  /**
    * Generate table definition
    */
   private generateTableDefinition(model: ModelDefinition): string {
@@ -236,7 +257,10 @@ export class DrizzleSchemaGenerator {
     // drizzle-orm (>=0.45) forbids pgSchema('public') — use pgTable() directly.
     const customSchema = getCustomSchema(model);
     if (customSchema) {
-      code += `const ${customSchema}Schema = pgSchema('${customSchema}');\n\n`;
+      // Exported on purpose: drizzle-kit discovers declared schemas through the module's
+      // exports, and creates (or drops) them accordingly. A non-exported instance makes it
+      // treat the schema as unknown and try to drop it.
+      code += `export const ${customSchema}Schema = pgSchema('${customSchema}');\n\n`;
     }
 
     // Start table definition (no type annotation needed)
@@ -281,14 +305,10 @@ export class DrizzleSchemaGenerator {
     // Field-level indexes
     for (const field of model.fields) {
       if (field.index) {
-        const isPostGISFieldType = isPostGISType(field.type);
-        const indexName = `idx_${model.name.toLowerCase()}_${field.name}`;
+        const method = this.indexMethod(field);
+        const target = method ? `.using('${method}', table.${field.name})` : `.on(table.${field.name})`;
 
-        if (isPostGISFieldType) {
-          tableConstraints.push(`  index('${indexName}').using('gist', table.${field.name})`);
-        } else {
-          tableConstraints.push(`  index('${indexName}').on(table.${field.name})`);
-        }
+        tableConstraints.push(`  index('${fieldIndexName(model, field.name)}')${target}`);
       }
     }
 
@@ -297,9 +317,9 @@ export class DrizzleSchemaGenerator {
     if (sdCol) {
       for (const field of model.fields) {
         if (field.unique) {
-          const idxName = `uq_${model.name.toLowerCase()}_${field.name}`;
           tableConstraints.push(
-            `  uniqueIndex('${idxName}').on(table.${field.name}).where(sql\`${sdCol} IS NULL\`)`,
+            `  uniqueIndex('${fieldUniqueIndexName(model, field.name)}')` +
+              `.on(table.${field.name}).where(sql\`${sdCol} IS NULL\`)`,
           );
         }
       }
@@ -308,20 +328,20 @@ export class DrizzleSchemaGenerator {
     // Model-level indexes
     if (model.indexes) {
       for (const idx of model.indexes) {
-        const indexName = idx.name || `idx_${model.name.toLowerCase()}_${idx.fields.join('_')}`;
+        const indexName = idx.name || modelIndexName(model, idx.fields);
         const indexType = idx.unique ? 'uniqueIndex' : 'index';
         const fields = idx.fields.map((f) => `table.${f}`).join(', ');
 
-        // Check if the first field is a PostGIS field
+        // An explicitly declared method wins, otherwise it follows the first column's type
         const firstField = model.fields.find((f) => f.name === idx.fields[0]);
-        const isPostGISIdx = firstField && isPostGISType(firstField.type);
+        const method = idx.type ?? this.indexMethod(firstField);
+        const target = method ? `.using('${method}', ${fields})` : `.on(${fields})`;
 
-        const partial = idx.unique && sdCol ? `.where(sql\`${sdCol} IS NULL\`)` : '';
-        if (isPostGISIdx) {
-          tableConstraints.push(`  ${indexType}('${indexName}').using('gist', ${fields})${partial}`);
-        } else {
-          tableConstraints.push(`  ${indexType}('${indexName}').on(${fields})${partial}`);
-        }
+        // A declared partial condition and the soft-delete filter are combined
+        const conditions = [idx.where, idx.unique && sdCol ? `${sdCol} IS NULL` : null].filter(Boolean);
+        const partial = conditions.length > 0 ? `.where(sql\`${conditions.join(' AND ')}\`)` : '';
+
+        tableConstraints.push(`  ${indexType}('${indexName}')${target}${partial}`);
       }
     }
 
@@ -331,7 +351,7 @@ export class DrizzleSchemaGenerator {
 
       constraintDefs.forEach((constraint, index) => {
         // Generate numbered constraint name (1-indexed)
-        const checkName = `check_${model.name.toLowerCase()}_numNotNulls${index + 1}`;
+        const checkName = checkConstraintName(model, index);
         // Convert field names to snake_case for SQL
         const columnNames = constraint.fields.map((f) => toSnakeCase(f)).join(', ');
         // Use the specified count from constraint.num
@@ -525,7 +545,10 @@ export class DrizzleSchemaGenerator {
     const geometryType = field.geometryType || field.type.toUpperCase();
     const srid = field.srid || 4326;
     const isGeography = field.type === 'geography';
-    const columnType = isGeography ? 'geography' : 'geometry';
+    // drizzle-kit renders any type it does not know natively as a quoted identifier. It knows
+    // "geometry", so geometry(SUBTYPE, SRID) comes out as a real type, but a parameterised
+    // geography would become the invalid "geography(...)" - so geography stays unmodified.
+    const columnType = isGeography ? 'geography' : `geometry(${geometryType}, ${srid})`;
 
     // Use customType for PostGIS fields since Drizzle doesn't have native support
     // Convert between GeoJSON (JavaScript standard) and WKT (PostGIS format)
@@ -536,7 +559,7 @@ export class DrizzleSchemaGenerator {
       `    driverData: string;`,
       `  }>({`,
       `    dataType() {`,
-      `      return '${columnType}(${geometryType}, ${srid})';`,
+      `      return '${columnType}';`,
       `    },`,
       `    toDriver(value: GeoJSON): string {`,
       `      return geoJsonToWKT(value, ${srid});`,
@@ -684,7 +707,7 @@ export class DrizzleSchemaGenerator {
 
     // Determine what imports we need based on the primary key types
     // Note: timestamps are stored as EPOCH milliseconds using bigint
-    const imports = new Set<string>(['pgTable', 'bigint', 'primaryKey', 'index']);
+    const imports = new Set<string>(['pgTable', 'bigint', 'primaryKey', 'foreignKey', 'index']);
 
     // Add the appropriate type import for each foreign key
     const sourceDrizzleType = this.getDrizzleImportForType(sourcePK);
@@ -719,12 +742,12 @@ export class DrizzleSchemaGenerator {
 `;
 
     // Generate source foreign key column
-    code += this.generateJunctionFKColumn(sourceFKColumn, sourcePK, sourceModel.name.toLowerCase(), sourcePK.name);
+    code += this.generateJunctionFKColumn(sourceFKColumn, sourcePK);
     code += `,
 `;
 
     // Generate target foreign key column
-    code += this.generateJunctionFKColumn(targetFKColumn, targetPK, targetModel.name.toLowerCase(), targetPK.name);
+    code += this.generateJunctionFKColumn(targetFKColumn, targetPK);
 
     // Add timestamps if enabled globally (stored as EPOCH milliseconds)
     // mode: 'number' returns JavaScript numbers (safe for EPOCH milliseconds)
@@ -737,11 +760,26 @@ export class DrizzleSchemaGenerator {
     code += `\n}, (table) => [\n`;
 
     // Add composite primary key
-    code += `  primaryKey({ columns: [table.${sourceFKColumn}, table.${targetFKColumn}] }),\n`;
+    // Constraints are named explicitly: drizzle derives names by concatenating table and
+    // column names of both sides, which for a junction table exceeds the 63 byte identifier
+    // limit and can collide with the primary key's name once the database truncates it.
+    code += `  primaryKey({ columns: [table.${sourceFKColumn}, table.${targetFKColumn}], ` +
+      `name: '${junctionPrimaryKeyName(tableName)}' }),\n`;
+
+    code += `  foreignKey({\n` +
+      `    columns: [table.${sourceFKColumn}],\n` +
+      `    foreignColumns: [${sourceModel.name.toLowerCase()}Table.${sourcePK.name}],\n` +
+      `    name: '${junctionForeignKeyName(tableName, sourceFKColumn)}',\n` +
+      `  }).onDelete('cascade'),\n`;
+    code += `  foreignKey({\n` +
+      `    columns: [table.${targetFKColumn}],\n` +
+      `    foreignColumns: [${targetModel.name.toLowerCase()}Table.${targetPK.name}],\n` +
+      `    name: '${junctionForeignKeyName(tableName, targetFKColumn)}',\n` +
+      `  }).onDelete('cascade'),\n`;
 
     // Add indexes for foreign keys
-    code += `  index('idx_${tableName.toLowerCase()}_${sourceFKColumn}').on(table.${sourceFKColumn}),\n`;
-    code += `  index('idx_${tableName.toLowerCase()}_${targetFKColumn}').on(table.${targetFKColumn})`;
+    code += `  index('${junctionIndexName(tableName, sourceFKColumn)}').on(table.${sourceFKColumn}),\n`;
+    code += `  index('${junctionIndexName(tableName, targetFKColumn)}').on(table.${targetFKColumn})`;
 
     code += `\n]);\n`;
     code += `\n`;
@@ -767,12 +805,7 @@ export class DrizzleSchemaGenerator {
   /**
    * Generate foreign key column for junction table
    */
-  private generateJunctionFKColumn(
-    columnName: string,
-    pkField: FieldDefinition,
-    tableName: string,
-    pkName: string,
-  ): string {
+  private generateJunctionFKColumn(columnName: string, pkField: FieldDefinition): string {
     let columnDef = '';
 
     // Generate the appropriate column type based on the primary key type
@@ -796,9 +829,8 @@ export class DrizzleSchemaGenerator {
         columnDef = `  ${columnName}: text('${columnName}')`;
     }
 
-    // Add the not null and references modifiers
+    // The foreign key is declared at table level so it can carry an explicit, short name
     columnDef += `\n    .notNull()`;
-    columnDef += `\n    .references(() => ${tableName}Table.${pkName}, { onDelete: 'cascade' })`;
 
     return columnDef;
   }

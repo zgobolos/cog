@@ -92,14 +92,14 @@ AdvancedDemo ──[oneToMany]──→ AdvancedDemo (children)
 
 ### 1. Database Setup
 
-Create a PostgreSQL database with PostGIS:
+Create an empty PostgreSQL database — that is the only manual step:
 
 ```sql
 CREATE DATABASE corporate_orm;
-\c corporate_orm
-CREATE EXTENSION IF NOT EXISTS postgis;
-CREATE SCHEMA analytics;
 ```
+
+The PostGIS extension is installed by `deno task db:bootstrap`, and the `analytics` schema is created by drizzle-kit
+from the generated schema definition (both run as part of `deno task drizzle:push` in step 4).
 
 ### 2. Environment Configuration
 
@@ -126,13 +126,15 @@ deno task cog:psql:generate
 deno task cog:crdb:generate
 ```
 
-### 4. Initialize Database
+### 4. Create the Database Schema
 
 ```bash
-deno task db:init
+deno task drizzle:push
 ```
 
-This creates all tables, indexes, relationships, and check constraints.
+This runs the bootstrap (PostGIS extension) and lets drizzle-kit create all tables, indexes, relationships and check
+constraints from the generated schema. For a production-style flow use `deno task drizzle:generate` followed by
+`deno task drizzle:migrate` instead, which writes versioned migration files into `drizzle/`.
 
 ### 5. Start Server
 
@@ -224,13 +226,13 @@ deno task db:clean
 
 Deletes all data from tables in dependency order, but keeps schema intact. Use this between test runs for fast cleanup.
 
-**Full Reset (Slow - Schema + Data):**
+**Schema Sync (after regenerating code):**
 
 ```bash
-deno task db:init
+deno task drizzle:push
 ```
 
-Drops and recreates all tables, indexes, and constraints. Use this when:
+Brings the database in line with the regenerated schema. Use this when:
 
 - Schema has changed (after regenerating code)
 - You need a complete fresh start
@@ -248,8 +250,8 @@ deno task db:clean
 # Run tests again
 deno task test
 
-# If schema changed, full reset (slow)
-deno task db:init
+# If the schema changed, sync it first
+deno task drizzle:push
 deno task test
 ```
 
@@ -572,7 +574,7 @@ example/
 ├── test/
 │   ├── api-demo.ts           # Comprehensive test suite (13 sections)
 │   └── http-client.ts        # Test utilities and assertions
-├── db-init.ts                # Database initialization script
+├── db-bootstrap.ts           # Database bootstrap (PostGIS extension)
 ├── quick-clean.ts            # Fast database cleanup (data only)
 ├── deno.json                 # Dependencies + tasks
 └── .env                      # Database configuration

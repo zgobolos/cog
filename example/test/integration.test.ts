@@ -1168,9 +1168,10 @@ async function runTests(): Promise<void> {
   const reused = await POST('/api/softdeletetestentity', { code: 'SD-1', name: 'Reused' }) as Record<string, unknown>;
   assertExists(reused.id, 'reused.id — soft-deleted row must not reserve the unique value');
   createdIds.softDeleteTestEntities = [reused.id as string];
-  // two live rows with the same code must still be rejected
+  // two live rows with the same code must still be rejected - a unique violation is a conflict,
+  // not a server error
   const dup = await REQUEST('POST', '/api/softdeletetestentity', { code: 'SD-1', name: 'Dup' });
-  assertEquals(dup.status >= 400, true, 'duplicate live unique code must be rejected');
+  assertEquals(dup.status, 409, 'duplicate live unique code must be rejected with HTTP 409');
 
   // 17.8 Timestamp interaction
   logStep('17.8 Timestamps: createdAt preserved, deletedAt recent, updatedAt untouched by soft delete');

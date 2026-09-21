@@ -11,8 +11,8 @@ import { type DependencyKind, GENERATED_CODE_DEPENDENCIES } from '../constants.t
 export interface DependencyReport {
   /** Needed while the application runs */
   runtime: Record<string, string>;
-  /** Only imported as a type - a dev dependency where that distinction exists */
-  types: Record<string, string>;
+  /** Not needed at runtime: type-only imports and tooling */
+  dev: Record<string, string>;
   /** Not imported by the generated code, offered because applications usually want it */
   optional: Record<string, { specifier: string; reason: string }>;
   /** Imported by the generated code but missing from GENERATED_CODE_DEPENDENCIES */
@@ -60,10 +60,10 @@ export const collectImportedPackages = (files: Map<string, string>): string[] =>
  * generated; the optional ones are suggestions that no generated file imports.
  */
 export const resolveDependencies = (files: Map<string, string>): DependencyReport => {
-  const report: DependencyReport = { runtime: {}, types: {}, optional: {}, unresolved: [] };
+  const report: DependencyReport = { runtime: {}, dev: {}, optional: {}, unresolved: [] };
   const grouped: Record<Exclude<DependencyKind, 'optional'>, Record<string, string>> = {
     runtime: report.runtime,
-    types: report.types,
+    dev: report.dev,
   };
 
   for (const name of collectImportedPackages(files)) {
@@ -105,12 +105,12 @@ export const formatDependencyReport = (report: DependencyReport): string => {
     lines.push('', 'Dependencies - required at runtime:', '', importEntries(Object.entries(report.runtime)));
   }
 
-  if (Object.keys(report.types).length > 0) {
+  if (Object.keys(report.dev).length > 0) {
     lines.push(
       '',
-      'Dev dependencies - imported as types only, never at runtime:',
+      'Dev dependencies - not needed at runtime (type-only imports and tooling):',
       '',
-      importEntries(Object.entries(report.types)),
+      importEntries(Object.entries(report.dev)),
     );
   }
 

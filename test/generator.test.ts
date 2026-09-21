@@ -97,8 +97,12 @@ Deno.test('generator - generates expected file structure', async () => {
     // Verify database files
     const dbStat = await Deno.stat(`${TEST_OUTPUT_PATH}/db/database.ts`);
     assertExists(dbStat);
-    const initDbStat = await Deno.stat(`${TEST_OUTPUT_PATH}/db/initialize-database.ts`);
-    assertExists(initDbStat);
+    // drizzle-kit owns the DDL; COG only emits the bootstrap and the drizzle-kit config
+    const bootstrapStat = await Deno.stat(`${TEST_OUTPUT_PATH}/db/bootstrap.ts`);
+    assertExists(bootstrapStat);
+    const configStat = await Deno.stat(`${TEST_OUTPUT_PATH}/drizzle.config.ts`);
+    assertExists(configStat);
+    await assertRejects(() => Deno.stat(`${TEST_OUTPUT_PATH}/db/initialize-database.ts`));
 
     // Verify utils files
     const filterStat = await Deno.stat(`${TEST_OUTPUT_PATH}/utils/filter.utils.ts`);
@@ -341,17 +345,23 @@ Deno.test('generator - soft delete schema column and field meta', async () => {
   }
 });
 
-Deno.test('generator - soft delete DDL column and partial unique index', async () => {
+Deno.test('generator - soft delete column and partial unique index in the schema', async () => {
   await cleanupSoftDelete();
   try {
     await generateSoftDeleteModel();
-    const ddl = await Deno.readTextFile(`${SD_OUTPUT}/db/initialize-database.ts`);
-    // Nullable deleted_at column (no DEFAULT, no NOT NULL)
-    assertEquals(/deleted_at INT8(?!\s+DEFAULT)(?!\s+NOT NULL)/.test(ddl), true);
-    // No plain UNIQUE constraint for the soft-delete table's unique field
-    assertEquals(ddl.includes('"softdeletedentity_code_unique" UNIQUE'), false);
-    // Partial unique index for field-level unique
-    assertEquals(ddl.includes('CREATE UNIQUE INDEX') && ddl.includes('WHERE deleted_at IS NULL'), true);
+    const schema = await Deno.readTextFile(`${SD_OUTPUT}/schema/softdeletedentity.schema.ts`);
+
+    // Nullable deleted_at column: no default and no notNull
+    assertEquals(/deletedAt: bigint\('deleted_at', \{ mode: 'number' \}\)(?!\.)/.test(schema), true);
+    // The unique field must not carry a plain .unique() - that would reserve the value forever
+    assertEquals(/code: varchar\([^)]*\)[^,]*\.unique\(\)/.test(schema), false);
+    // Field-level unique becomes a partial unique index over live rows
+    assertEquals(
+      /uniqueIndex\('uq_softdeletedentity_code'\).*\.where\(sql`deleted_at IS NULL`\)/.test(schema),
+      true,
+    );
+    // The model-level unique index is partial too
+    assertEquals(/uniqueIndex\('idx_softdeletedentity_code_name'\).*deleted_at IS NULL/.test(schema), true);
   } finally {
     await cleanupSoftDelete();
   }
@@ -502,29 +512,26 @@ Deno.test('generator - soft delete: field with index+unique emits no non-partial
   await cleanupSoftDeleteUniqueIndex();
   try {
     await generateSoftDeleteUniqueIndexModel();
-    const ddl = await Deno.readTextFile(`${SD_UQIDX_OUTPUT}/db/initialize-database.ts`);
+    const schema = await Deno.readTextFile(`${SD_UQIDX_OUTPUT}/schema/sduqidx.schema.ts`);
 
-    // The field-level loop must NOT emit a non-partial CREATE UNIQUE INDEX for `code`
-    // (the only UNIQUE index on `code` must be the partial one with WHERE deleted_at IS NULL)
-    const lines = ddl.split('\n');
-    for (const line of lines) {
-      if (line.includes('CREATE UNIQUE INDEX') && line.includes('"code"') && !line.includes('WHERE')) {
-        throw new Error(
-          `Found a non-partial CREATE UNIQUE INDEX on "code" in a soft-delete model — this is the leak: ${line}`,
-        );
+    // No unique index on `code` without a WHERE clause - a non-partial one would let a
+    // soft-deleted row keep reserving the value
+    for (const line of schema.split('\n')) {
+      if (line.includes('uniqueIndex(') && line.includes('code') && !line.includes('.where(')) {
+        throw new Error(`Found a non-partial unique index on code in a soft-delete model: ${line}`);
       }
     }
 
     // The partial unique index must still be there
     assertEquals(
-      ddl.includes('CREATE UNIQUE INDEX') && ddl.includes('WHERE deleted_at IS NULL'),
+      /uniqueIndex\('uq_sduqidx_code'\).*\.where\(sql`deleted_at IS NULL`\)/.test(schema),
       true,
       'Partial unique index (WHERE deleted_at IS NULL) must exist',
     );
 
-    // A plain non-unique index (idx_) for code is fine (for query performance)
+    // A plain non-unique index for code is fine (for query performance)
     assertEquals(
-      ddl.includes('"idx_sd_uq_idx_code"'),
+      schema.includes("index('idx_sduqidx_code')"),
       true,
       'A plain non-unique index for code must still be emitted',
     );
@@ -629,10 +636,12 @@ Deno.test('generator - no PostGIS extension without spatial fields', async () =>
     await writePostGISModels(false);
     await generateFromModels(PG_MODELS, PG_OUTPUT);
 
-    const init = await Deno.readTextFile(`${PG_OUTPUT}/db/initialize-database.ts`);
+    const bootstrap = await Deno.readTextFile(`${PG_OUTPUT}/db/bootstrap.ts`);
     // CREATE EXTENSION fails on a plain PostgreSQL without PostGIS installed
-    assertEquals(init.includes('CREATE EXTENSION'), false);
-    assertEquals(init.toLowerCase().includes('postgis'), false);
+    assertEquals(bootstrap.includes('CREATE EXTENSION'), false);
+    // ... and drizzle-kit must not be told to filter an extension that is not there
+    const config = await Deno.readTextFile(`${PG_OUTPUT}/drizzle.config.ts`);
+    assertEquals(config.includes('extensionsFilters'), false);
 
     // spatial utilities must not be emitted either
     let spatialUtilsExists = true;
@@ -653,9 +662,13 @@ Deno.test('generator - PostGIS extension is created when a model has a spatial f
     await writePostGISModels(true);
     await generateFromModels(PG_MODELS, PG_OUTPUT);
 
-    const init = await Deno.readTextFile(`${PG_OUTPUT}/db/initialize-database.ts`);
-    assertEquals(init.includes('CREATE EXTENSION IF NOT EXISTS postgis'), true);
+    const bootstrap = await Deno.readTextFile(`${PG_OUTPUT}/db/bootstrap.ts`);
+    assertEquals(bootstrap.includes('CREATE EXTENSION IF NOT EXISTS postgis'), true);
     assertExists(await Deno.readTextFile(`${PG_OUTPUT}/schema/spatial-utils.ts`));
+
+    // push would otherwise offer to drop the tables PostGIS creates for itself
+    const config = await Deno.readTextFile(`${PG_OUTPUT}/drizzle.config.ts`);
+    assertEquals(config.includes("extensionsFilters: ['postgis']"), true);
   } finally {
     await cleanupPostGIS();
   }
@@ -683,9 +696,9 @@ Deno.test('generator - postgis: false generates normally without spatial fields'
     await writePostGISModels(false);
     await generateFromModels(PG_MODELS, PG_OUTPUT, { database: { type: 'postgresql', postgis: false } });
 
-    const init = await Deno.readTextFile(`${PG_OUTPUT}/db/initialize-database.ts`);
-    assertEquals(init.includes('CREATE EXTENSION'), false);
-    assertEquals(init.includes('"plain_entity"'), true);
+    const bootstrap = await Deno.readTextFile(`${PG_OUTPUT}/db/bootstrap.ts`);
+    assertEquals(bootstrap.includes('CREATE EXTENSION'), false);
+    assertExists(await Deno.readTextFile(`${PG_OUTPUT}/schema/plainentity.schema.ts`));
   } finally {
     await cleanupPostGIS();
   }
@@ -709,6 +722,12 @@ Deno.test('generator - client errors map to HTTP 400 in the REST layer', async (
     // A malformed JSON body is a client error, not a 500
     assertEquals(/export const parseJsonBody\s*=\s*async </.test(helpers), true);
     assertEquals(helpers.includes("throw new HTTPException(400, { message: 'Invalid JSON in request body' })"), true);
+
+    // Constraint violations are the request's fault, not the server's
+    assertEquals(helpers.includes("'23505': 409"), true);
+    assertEquals(helpers.includes("'23503': 400"), true);
+    // drizzle wraps driver errors, so the SQLSTATE has to be read from the cause
+    assertEquals(helpers.includes('(error as { cause?: unknown }).cause ?? error'), true);
 
     // Handlers must go through parseJsonBody instead of c.req.json()
     const factory = await Deno.readTextFile(`${PG_OUTPUT}/rest/crud.factory.ts`);
@@ -775,8 +794,8 @@ Deno.test('generator - reports the dependencies the generated code imports', asy
       'postgres',
       'zod',
     ]);
-    // openapi-types is only ever imported as a type
-    assertEquals(Object.keys(dependencies.types), ['openapi-types']);
+    // drizzle-kit is tooling, openapi-types is a type-only import - neither is there at runtime
+    assertEquals(Object.keys(dependencies.dev), ['drizzle-kit', 'openapi-types']);
     // Scalar is never imported by the generated code - it stays an optional suggestion
     assertEquals(Object.keys(dependencies.optional), ['@scalar/hono-api-reference']);
   } finally {
@@ -816,7 +835,7 @@ async function cleanupSchemaDDL() {
 // Regression: the Drizzle schema wraps a non-default schema in pgSchema(), so the DDL has to
 // create that schema and qualify every table reference with it. Unqualified DDL creates the
 // table in the default schema while the ORM queries the declared one.
-Deno.test('generator - DDL creates and qualifies a non-default schema', async () => {
+Deno.test('generator - non-default schema is created by the bootstrap and used by the schema', async () => {
   await cleanupSchemaDDL();
   try {
     await Deno.mkdir(SCHEMA_DDL_MODELS, { recursive: true });
@@ -842,27 +861,98 @@ Deno.test('generator - DDL creates and qualifies a non-default schema', async ()
     await Deno.writeTextFile(`${SCHEMA_DDL_MODELS}/report.json`, JSON.stringify(report, null, 2));
     await generateFromModels(SCHEMA_DDL_MODELS, SCHEMA_DDL_OUTPUT);
 
-    const init = await Deno.readTextFile(`${SCHEMA_DDL_OUTPUT}/db/initialize-database.ts`);
+    // push and generate only create a schema they can see, and they discover it through the
+    // module's exports - a non-exported pgSchema makes drizzle-kit try to drop the schema
+    const reportSchema = await Deno.readTextFile(`${SCHEMA_DDL_OUTPUT}/schema/report.schema.ts`);
+    assertEquals(reportSchema.includes("export const analyticsSchema = pgSchema('analytics')"), true);
+    assertEquals(reportSchema.includes("analyticsSchema.table('report'"), true);
 
-    // The schema itself has to exist before the tables are created
-    assertEquals(init.includes('CREATE SCHEMA IF NOT EXISTS "analytics"'), true);
-    assertEquals(init.includes('CREATE SCHEMA IF NOT EXISTS "public"'), false);
+    // push introspects only the schemas it is told about
+    const config = await Deno.readTextFile(`${SCHEMA_DDL_OUTPUT}/drizzle.config.ts`);
+    assertEquals(config.includes("schemaFilter: ['public', 'analytics']"), true);
 
-    // Every reference to the analytics table is qualified
-    assertEquals(init.includes('CREATE TABLE IF NOT EXISTS "analytics"."report"'), true);
-    assertEquals(init.includes('DROP TABLE IF EXISTS "analytics"."report" CASCADE'), true);
-    assertEquals(/ON "analytics"\."report"/.test(init), true);
-    assertEquals(/ALTER TABLE "analytics"\."report" .*REFERENCES "owner"\("id"\)/.test(init), true);
+    // Schemas are drizzle-kit's job, so the bootstrap must not create them
+    const bootstrap = await Deno.readTextFile(`${SCHEMA_DDL_OUTPUT}/db/bootstrap.ts`);
+    assertEquals(bootstrap.includes('CREATE SCHEMA'), false);
 
     // A model on the default schema stays unqualified
-    assertEquals(init.includes('CREATE TABLE IF NOT EXISTS "owner"'), true);
-    assertEquals(init.includes('"public"."owner"'), false);
-
-    // ... and the Drizzle side still agrees with it
-    const reportSchema = await Deno.readTextFile(`${SCHEMA_DDL_OUTPUT}/schema/report.schema.ts`);
-    assertEquals(reportSchema.includes("pgSchema('analytics')"), true);
-    assertEquals(reportSchema.includes("analyticsSchema.table('report'"), true);
+    const ownerSchema = await Deno.readTextFile(`${SCHEMA_DDL_OUTPUT}/schema/owner.schema.ts`);
+    assertEquals(ownerSchema.includes("pgTable('owner'"), true);
+    assertEquals(ownerSchema.includes('pgSchema('), false);
   } finally {
     await cleanupSchemaDDL();
+  }
+});
+
+const LONG_NAME_MODELS = './test/test-longname-models';
+const LONG_NAME_OUTPUT = './test/test-longname-generated';
+
+async function cleanupLongName() {
+  for (const p of [LONG_NAME_MODELS, LONG_NAME_OUTPUT]) {
+    try {
+      await Deno.remove(p, { recursive: true });
+    } catch { /* ignore */ }
+  }
+}
+
+async function generateWithModel(model: Record<string, unknown>): Promise<void> {
+  await Deno.mkdir(LONG_NAME_MODELS, { recursive: true });
+  await Deno.writeTextFile(`${LONG_NAME_MODELS}/model.json`, JSON.stringify(model, null, 2));
+  await generateFromModels(LONG_NAME_MODELS, LONG_NAME_OUTPUT);
+}
+
+// PostgreSQL truncates identifiers at 63 bytes, which breaks the schema rather than degrading
+// it - the ORM keeps using the full name. Generation must stop instead.
+Deno.test('generator - aborts when a table name exceeds the identifier limit', async () => {
+  await cleanupLongName();
+  try {
+    await assertRejects(
+      () =>
+        generateWithModel({
+          name: 'LongEntity',
+          tableName: 'a'.repeat(64),
+          fields: [{ name: 'id', type: 'uuid', primaryKey: true, required: true }],
+        }),
+      Error,
+      'Generation aborted due to validation errors',
+    );
+  } finally {
+    await cleanupLongName();
+  }
+});
+
+Deno.test('generator - aborts when a derived index name exceeds the identifier limit', async () => {
+  await cleanupLongName();
+  try {
+    // The table name fits, but idx_<model>_<field> does not
+    await assertRejects(
+      () =>
+        generateWithModel({
+          name: 'Entity',
+          tableName: 'entity',
+          fields: [
+            { name: 'id', type: 'uuid', primaryKey: true, required: true },
+            { name: 'f'.repeat(60), type: 'string', maxLength: 10, index: true },
+          ],
+        }),
+      Error,
+      'Generation aborted due to validation errors',
+    );
+  } finally {
+    await cleanupLongName();
+  }
+});
+
+Deno.test('generator - a name at the identifier limit is accepted', async () => {
+  await cleanupLongName();
+  try {
+    await generateWithModel({
+      name: 'Boundary',
+      tableName: 'b'.repeat(63),
+      fields: [{ name: 'id', type: 'uuid', primaryKey: true, required: true }],
+    });
+    assertExists(await Deno.readTextFile(`${LONG_NAME_OUTPUT}/schema/boundary.schema.ts`));
+  } finally {
+    await cleanupLongName();
   }
 });

@@ -214,6 +214,32 @@ export const parseJsonBody = async <T = Record<string, unknown>>(c: Context): Pr
 };
 
 /**
+ * Database errors that the request caused rather than the server.
+ * Anything not listed here stays a 500: it is a bug or an outage, not a client mistake.
+ */
+const CLIENT_ERROR_STATUS_BY_SQLSTATE: Record<string, 400 | 409> = {
+  '23505': 409, // unique_violation
+  '23502': 400, // not_null_violation
+  '23503': 400, // foreign_key_violation
+  '23514': 400, // check_violation
+  '22001': 400, // string_data_right_truncation
+  '22007': 400, // invalid_datetime_format
+  '22P02': 400, // invalid_text_representation
+};
+
+/**
+ * Reads the SQLSTATE of a database error. Drizzle wraps driver errors in a DrizzleQueryError,
+ * so the code sits on the cause rather than on the error itself.
+ */
+const databaseErrorStatus = (error: unknown): { status: 400 | 409; constraint?: string } | null => {
+  const driverError = (error as { cause?: unknown }).cause ?? error;
+  const { code, constraint_name } = (driverError ?? {}) as { code?: string; constraint_name?: string };
+  const status = code ? CLIENT_ERROR_STATUS_BY_SQLSTATE[code] : undefined;
+
+  return status ? { status, constraint: constraint_name } : null;
+};
+
+/**
  * Converts domain exceptions to HTTP exceptions
  * Handles centralized error conversion from domain layer
  */
@@ -227,6 +253,14 @@ export function handleDomainException(error: unknown): never {
   // Zod validation failures (e.g. minLength/maxLength, required, enum) are client errors
   if (isZodError(error)) {
     throw new HTTPException(400, { message: JSON.stringify(error.issues) });
+  }
+  // Constraint violations are caused by the request, so they are 4xx rather than 500
+  const databaseError = databaseErrorStatus(error);
+  if (databaseError) {
+    const detail = databaseError.constraint ? \`: \${databaseError.constraint}\` : '';
+    throw new HTTPException(databaseError.status, {
+      message: \`\${databaseError.status === 409 ? 'Conflict' : 'Constraint violation'}\${detail}\`,
+    });
   }
   throw error; // Re-throw unknown errors
 }

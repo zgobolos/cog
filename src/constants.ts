@@ -62,10 +62,10 @@ export const isValidDataType = (type: string): type is DataType => {
  * How a consuming project should declare a dependency
  *
  * - `runtime`: needed when the application runs
- * - `types`: only imported as a type, so it belongs to dev dependencies where that split exists
+ * - `dev`: not present at runtime - a type-only import or a build/migration tool
  * - `optional`: never imported by the generated code, only by an application that wants the feature
  */
-export type DependencyKind = 'runtime' | 'types' | 'optional';
+export type DependencyKind = 'runtime' | 'dev' | 'optional';
 
 export interface GeneratedDependency {
   specifier: string;
@@ -87,9 +87,14 @@ export const GENERATED_CODE_DEPENDENCIES: Record<string, GeneratedDependency> = 
     kind: 'optional',
     reason: 'only if the application serves the API documentation UI',
   },
+  'drizzle-kit': {
+    specifier: 'npm:drizzle-kit@^0.31.10',
+    kind: 'dev',
+    reason: 'creates and migrates the database from the generated schema',
+  },
   'drizzle-orm': { specifier: 'npm:drizzle-orm@^0.45.2', kind: 'runtime' },
   'drizzle-zod': { specifier: 'npm:drizzle-zod@^0.8.3', kind: 'runtime' },
-  'openapi-types': { specifier: 'npm:openapi-types@^12.1.3', kind: 'types' },
+  'openapi-types': { specifier: 'npm:openapi-types@^12.1.3', kind: 'dev' },
   'postgres': { specifier: 'npm:postgres@^3.4.9', kind: 'runtime' },
   // Imported as a type only, but drizzle-zod resolves it as a runtime peer dependency
   'zod': { specifier: 'npm:zod@^4.6.5', kind: 'runtime' },

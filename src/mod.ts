@@ -104,13 +104,12 @@ export async function generateFromModels(
   const dbInitGenerator = new DatabaseInitGenerator(models, {
     dbType: config.database.type,
     postgis: config.database.postgis,
+    outputPath,
   });
 
   files.set('db/database.ts', dbInitGenerator.generateDatabaseInit());
-  files.set(
-    'db/initialize-database.ts',
-    dbInitGenerator.generateDatabaseInitialization(),
-  );
+  files.set('db/bootstrap.ts', dbInitGenerator.generateBootstrap());
+  files.set('drizzle.config.ts', dbInitGenerator.generateDrizzleConfig());
 
   // Generate domain exceptions
   const exceptionsGenerator = new DomainExceptionsGenerator();

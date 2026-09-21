@@ -77,7 +77,26 @@ Create `models/department.json`:
 deno run -A src/cli.ts --modelsPath ./models --outputPath ./generated
 ```
 
-### 3. Use Generated Backend
+### 3. Create the Database
+
+The generated code brings no DDL of its own — [drizzle-kit](https://orm.drizzle.team/kit-docs/overview) creates the
+tables from the generated schema, which is also what gives you migrations later.
+
+```bash
+# DB_URL in .env, e.g. DB_URL=postgresql://user:pass@localhost:5432/mydb
+deno run -A --env-file=.env ./generated/db/bootstrap.ts   # extensions (PostGIS)
+
+# a scratch database you can throw away:
+deno run -A --env-file=.env npm:drizzle-kit push --config=./generated/drizzle.config.ts
+
+# a database that will hold real data - start its migration history right away:
+deno run -A --env-file=.env npm:drizzle-kit generate --config=./generated/drizzle.config.ts
+deno run -A --env-file=.env npm:drizzle-kit migrate --config=./generated/drizzle.config.ts
+```
+
+Pick one per database and stay with it — see [Database Lifecycle](#database-lifecycle).
+
+### 4. Use Generated Backend
 
 ```typescript
 import { Hono } from '@hono/hono';
@@ -146,7 +165,7 @@ generated/
 +-- index.ts                    # initializeGenerated() entry point
 +-- db/
 |   +-- database.ts             # Connection pooling, transactions
-|   +-- initialize-database.ts  # Table creation, PostGIS setup
+|   +-- bootstrap.ts            # PostGIS extension (PostgreSQL only)
 +-- schema/
 |   +-- [model].schema.ts       # Drizzle tables + Zod schemas
 |   +-- spatial-utils.ts        # GeoJSON <-> WKT conversion
@@ -281,9 +300,9 @@ deno run -A src/cli.ts [options]
 | `--no-postgis`        | Turn PostGIS off entirely (see below) | PostGIS on    |
 | `--verbose`           | Show file paths                       | false         |
 
-**PostGIS:** `CREATE EXTENSION IF NOT EXISTS postgis` is emitted into `db/initialize-database.ts` only when at least one
-model actually declares a spatial field, so a project without spatial fields initializes on a plain PostgreSQL that has
-no PostGIS installed.
+**PostGIS:** `CREATE EXTENSION IF NOT EXISTS postgis` is emitted into `db/bootstrap.ts` only for PostgreSQL, and only
+when at least one model actually declares a spatial field — so a project without spatial fields initializes on a plain
+PostgreSQL that has no PostGIS installed. CockroachDB has spatial support built in and never receives the statement.
 
 `--no-postgis` turns PostGIS off completely: no spatial support in the generated code and no extension statement. A
 model that declares a spatial field is then a configuration error and generation fails with a message naming the fields
@@ -291,6 +310,65 @@ model that declares a spatial field is then a configuration error and generation
 
 **After every run** the generator prints the packages the generated code needs, grouped into dependencies, dev
 dependencies and optional ones — see [Generated Code Dependencies](#generated-code-dependencies).
+
+---
+
+## Database Lifecycle
+
+COG generates no DDL. The generated Drizzle schema is the source of truth, and
+[drizzle-kit](https://orm.drizzle.team/kit-docs/overview) turns it into tables — which is also what gives you
+migrations.
+
+The generated output is a plain Drizzle schema plus a plain `drizzle.config.ts`, so the drizzle-kit documentation
+applies to it as written. Note the two meanings of "generate": `cog:psql:generate` regenerates the **schema** from your
+models, while `drizzle-kit generate` writes a **migration** by diffing that schema against its snapshot history.
+
+```bash
+KIT="npm:drizzle-kit --config=./generated/drizzle.config.ts"
+
+deno run -A --env-file=.env ./generated/db/bootstrap.ts   # once: extensions (PostGIS on PostgreSQL)
+deno run -A --env-file=.env $KIT push                     # development and tests: sync to the schema
+deno run -A --env-file=.env $KIT generate                 # production: write a versioned migration
+deno run -A --env-file=.env $KIT migrate                  # production: apply pending migrations
+```
+
+Worth adding to your own `deno.json` (this is what `example/deno.json` does):
+
+```json
+{
+  "tasks": {
+    "db:bootstrap": "deno run -A --env-file=.env ./generated/db/bootstrap.ts",
+    "drizzle:push": "deno task db:bootstrap && deno run -A --env-file=.env npm:drizzle-kit push --force --config=./generated/drizzle.config.ts",
+    "drizzle:generate": "deno run -A --env-file=.env npm:drizzle-kit generate --config=./generated/drizzle.config.ts",
+    "drizzle:migrate": "deno task db:bootstrap && deno run -A --env-file=.env npm:drizzle-kit migrate --config=./generated/drizzle.config.ts"
+  }
+}
+```
+
+A model change is then an ordinary migration, safe to run against a database that holds data:
+
+```bash
+deno task cog:psql:generate   # regenerate the schema from the changed models
+deno task drizzle:generate    # -> drizzle/0001_....sql: ALTER TABLE "skill" ADD COLUMN "category" varchar(50);
+deno task drizzle:migrate     # applied to the live database, existing rows untouched
+```
+
+Commit the whole `drizzle/` directory, `meta/` included: the journal and the snapshots under it **are** the history
+drizzle-kit diffs against. Without them the next `generate` starts over from an empty baseline.
+
+**Read the generated SQL before applying it.** drizzle-kit sees the difference between two schemas, not your intention:
+a renamed column looks like a dropped one plus a new one, which loses its data. It asks interactively when it suspects a
+rename, so run `drizzle:generate` in a terminal rather than in CI, and hand-edit the migration when the diff is not what
+you meant. `drizzle:migrate` is the only part that belongs in a deployment pipeline.
+
+> **Choose the path when you create the database, not later.** `push` writes no migration history, so a database created
+> with `push` cannot be migrated afterwards: the first `generate` produces a full `CREATE TABLE` baseline and `migrate`
+> then fails against the existing tables. Use `push` for scratch and test databases, and `generate` + `migrate` from the
+> very first deployment of anything that holds real data. Moving a pushed database onto migrations means generating the
+> baseline and recording it as already applied by hand.
+
+Both PostgreSQL and CockroachDB are supported by the same generated schema, with PostGIS on both. CockroachDB has
+spatial support built in, so it needs no extension and never receives `CREATE EXTENSION`.
 
 ---
 
@@ -493,8 +571,11 @@ on **both create and update**. A value outside the bounds throws a `ZodError`, w
 > zod 3.25.x — an identity check would silently fail there and turn every validation error into a 500.
 
 A request body that is not valid JSON is also a client error: every generated handler reads the body through
-`parseJsonBody`, which answers **HTTP 400** instead of letting the parse failure surface as a 500. Database constraint
-violations (unique, not-null, foreign key, check) are **not** translated — they still return 500.
+`parseJsonBody`, which answers **HTTP 400** instead of letting the parse failure surface as a 500.
+
+Database constraint violations are mapped by their SQLSTATE too — a unique violation answers **409**, and not-null,
+foreign key, check, length and format violations answer **400**, naming the violated constraint. Any other database
+error stays a 500, because that is an outage or a bug rather than a client mistake.
 
 - `maxLength` also sets the `varchar` column length for `string` fields; `text` columns stay unbounded but still get the
   Zod `max` check.
@@ -647,7 +728,7 @@ See the `/example` directory for a complete Corporate ORM demonstration featurin
 ```bash
 cd example
 deno task cog:psql:generate
-deno task db:init
+deno task drizzle:push
 deno run -A src/main.ts
 ```
 
@@ -710,7 +791,10 @@ The pre-commit hook automatically:
 | ------------------- | ------------------------- |
 | `cog:psql:generate` | Generate for PostgreSQL   |
 | `cog:crdb:generate` | Generate for CockroachDB  |
-| `db:init`           | Initialize database       |
+| `db:bootstrap`      | Prepare extensions        |
+| `drizzle:push`      | Sync schema (dev/test)    |
+| `drizzle:generate`  | Create a migration        |
+| `drizzle:migrate`   | Apply migrations          |
 | `db:clean`          | Clean database            |
 | `fmt` / `fmt:check` | Format / check formatting |
 | `lint` / `check`    | Lint / type check         |
@@ -771,6 +855,7 @@ Add to your `deno.json`:
   "imports": {
     "@hono/hono": "jsr:@hono/hono@^4.13.8",
     "@scalar/hono-api-reference": "npm:@scalar/hono-api-reference@^0.12.2",
+    "drizzle-kit": "npm:drizzle-kit@^0.31.10",
     "drizzle-orm": "npm:drizzle-orm@^0.45.2",
     "drizzle-zod": "npm:drizzle-zod@^0.8.3",
     "openapi-types": "npm:openapi-types@^12.1.3",

@@ -1,88 +1,47 @@
-import { FieldDefinition, ModelDefinition } from '../types/model.types.ts';
-import { getCustomSchema, getSoftDeleteColumn, modelsHavePostGISFields } from '../utils/field.utils.ts';
-import { toSnakeCase } from '../utils/string.utils.ts';
+import { ModelDefinition } from '../types/model.types.ts';
+import { getCustomSchema, modelsHavePostGISFields } from '../utils/field.utils.ts';
 
 /**
- * Generates database initialization code
+ * Generates the database connection module, the bootstrap script and the drizzle-kit config.
+ *
+ * COG does not generate DDL: the Drizzle schema is the single source of truth and drizzle-kit
+ * turns it into tables (`push` for development, `generate` + `migrate` for production). Only
+ * what drizzle-kit cannot express - the PostGIS extension and non-default schemas - is emitted
+ * here as a bootstrap step that has to run first.
  */
 export class DatabaseInitGenerator {
   private models: ModelDefinition[];
   private dbType: 'postgresql' | 'cockroachdb';
-  /** PostGIS support: drives spatial column types and GIST index methods */
+  /** PostGIS support: spatial column types in the generated schema */
   private postgis: boolean;
-  /** Whether the initialization script has to create the PostGIS extension */
-  private requiresPostGISExtension: boolean;
+  /** Where the generated code is written, as drizzle-kit resolves paths from the project root */
+  private outputPath: string;
 
   constructor(
     models: ModelDefinition[],
-    options: { dbType?: string; postgis?: boolean } = {},
+    options: { dbType?: string; postgis?: boolean; outputPath?: string } = {},
   ) {
     this.models = models;
     this.dbType = options.dbType === 'cockroachdb' ? 'cockroachdb' : 'postgresql';
     this.postgis = options.postgis !== false;
-    // The extension is only required when a model actually declares a spatial field,
-    // otherwise CREATE EXTENSION fails on a plain PostgreSQL without PostGIS installed
-    this.requiresPostGISExtension = this.postgis && modelsHavePostGISFields(models);
+    this.outputPath = (options.outputPath ?? './generated').replace(/\/+$/, '');
   }
 
   /**
-   * Generate database initialization script
+   * Schemas the models use beyond Postgres' default one
    */
-  generateDatabaseInitialization(): string {
-    const createSchemas = this.generateSchemaCreationSQL();
-    const createPostgis = this.requiresPostGISExtension
-      ? "\n    // Create PostGIS extension\n    await sql`CREATE EXTENSION IF NOT EXISTS postgis`;\n    logger.info?.('PostGIS extension created');"
-      : '';
-
-    // Remove extra indentation and fix template
-    return `import { connect, DatabaseConfig, disconnect, getSQL, getLogger } from './database.ts';
-
-// Handle interruption signals
-Deno.addSignalListener("SIGINT", async () => {
-  const logger = getLogger();
-  logger.info?.('\\nReceived interrupt signal');
-  await disconnect();
-  logger.info?.('Database connection closed');
-  Deno.exit(0);
-});
-
-export async function initializeDatabase(config: DatabaseConfig) {
-  try {
-    // Initialize database with the existing configuration
-    await connect(config);
-
-    const sql = getSQL();
-    const logger = getLogger();
-${createPostgis}
-${createSchemas}
-
-    // Drop existing tables (in reverse dependency order)
-${this.generateTableDropSQL()}
-
-    // Create tables (without foreign key constraints)
-${this.generateTableCreationSQL()}
-
-    // Create junction tables for many-to-many relationships (without foreign key constraints)
-${this.generateJunctionTableCreationSQL()}
-
-    // Add foreign key constraints (after all tables exist)
-${this.generateForeignKeyConstraintsSQL()}
-
-    // Create indexes
-${this.generateIndexCreationSQL()}
-
-    logger.info?.('Database initialization completed successfully');
-  } catch (error) {
-    const logger = getLogger();
-    logger.error?.('Error during database initialization:', error);
-    throw error;
-  } finally {
-    const logger = getLogger();
-    await disconnect();
-    logger.info?.('Database connection closed');
+  private customSchemas(): string[] {
+    return [
+      ...new Set(this.models.map(getCustomSchema).filter((schema): schema is string => schema !== null)),
+    ].sort();
   }
-}
-`;
+
+  /**
+   * Whether the database needs the PostGIS extension installed.
+   * CockroachDB has spatial support built in and does not implement CREATE EXTENSION.
+   */
+  private requiresPostGISExtension(): boolean {
+    return this.dbType === 'postgresql' && this.postgis && modelsHavePostGISFields(this.models);
   }
 
   /**
@@ -352,625 +311,85 @@ export async function healthCheck(): Promise<boolean> {
   }
 
   /**
-   * Table reference for DDL, schema-qualified unless the model lives in Postgres' default
-   * schema. Mirrors the pgTable()/pgSchema() choice of the Drizzle schema generator - the two
-   * must agree or the ORM queries a table the DDL never created.
+   * Generate the bootstrap script.
+   *
+   * Runs the statements drizzle-kit does not emit, and has to run before `push` or `migrate`.
    */
-  private tableRef(model: ModelDefinition): string {
-    const tableName = model.tableName || model.name.toLowerCase();
-    const schema = getCustomSchema(model);
-    return schema ? `"${schema}"."${tableName}"` : `"${tableName}"`;
+  generateBootstrap(): string {
+    // Schemas are drizzle-kit's job - it creates every exported pgSchema. The extension is not,
+    // because it has to exist before the first spatial column is created.
+    const body = this.requiresPostGISExtension()
+      ? `    await sql\`CREATE EXTENSION IF NOT EXISTS postgis\`;\n` +
+        `    logger.info?.('PostGIS extension ready');`
+      : '    // Nothing to prepare: these models need no database extension';
+
+    return `import { connect, DatabaseConfig, disconnect, getLogger, getSQL } from './database.ts';
+
+/**
+ * Prepares what drizzle-kit cannot create itself.
+ *
+ * drizzle-kit owns the tables and the schemas; the PostGIS extension has to be installed before
+ * the first spatial column exists. Run this before \`drizzle-kit push\` or \`drizzle-kit migrate\`,
+ * it is idempotent.
+ */
+export async function bootstrapDatabase(config: DatabaseConfig) {
+  await connect(config);
+
+  const sql = getSQL();
+  const logger = getLogger();
+
+  try {
+${body}
+
+    logger.info?.('Database bootstrap completed');
+  } finally {
+    await disconnect();
+  }
+}
+
+// Runnable directly, so no wrapper script is needed:
+//   deno run -A --env-file=.env <generated>/db/bootstrap.ts
+if (import.meta.main) {
+  const connectionString = Deno.env.get('DB_URL');
+  if (!connectionString) {
+    console.error('DB_URL is not set');
+    Deno.exit(1);
+  }
+
+  const caFile = Deno.env.get('DB_SSL_CA_FILE');
+  await bootstrapDatabase({
+    connectionString,
+    ssl: caFile ? { ca: Deno.readTextFileSync(caFile) } : undefined,
+  });
+}
+`;
   }
 
   /**
-   * Table reference of a referenced model, looked up by model name.
-   * Falls back to the snake_cased model name when the target is unknown.
+   * Generate the drizzle-kit configuration.
+   *
+   * schemaFilter has to list every schema the models use, otherwise push would treat the tables
+   * of a non-default schema as unknown. extensionsFilters keeps push away from the tables PostGIS
+   * creates for itself (spatial_ref_sys), which it would otherwise offer to drop.
    */
-  private referencedTableRef(modelName: string): string {
-    const model = this.models.find((m) => m.name === modelName);
-    return model ? this.tableRef(model) : `"${toSnakeCase(modelName)}"`;
-  }
-
-  /**
-   * Generate CREATE SCHEMA statements for every non-default schema the models use
-   */
-  private generateSchemaCreationSQL(): string {
-    const schemas = [
-      ...new Set(this.models.map(getCustomSchema).filter((schema): schema is string => schema !== null)),
-    ].sort();
-
-    if (schemas.length === 0) return '';
-
-    const statements = schemas.map((schema) =>
-      `    await sql\`CREATE SCHEMA IF NOT EXISTS "${schema}"\`;\n` +
-      `    logger.info?.('Created schema if not exists: ${schema}');`
-    );
-
-    return `\n    // Create non-default schemas\n${statements.join('\n')}`;
-  }
-
-  /**
-   * Generate SQL statements for dropping tables
-   */
-  private generateTableDropSQL(): string {
-    const drops: string[] = [];
-
-    // First, drop junction tables (they depend on main tables)
-    const processedJunctions = new Set<string>();
-    for (const model of this.models) {
-      if (!model.relationships) continue;
-      for (const rel of model.relationships) {
-        if (rel.type === 'manyToMany' && rel.through) {
-          if (!processedJunctions.has(rel.through)) {
-            processedJunctions.add(rel.through);
-            const junctionTableName = rel.through.toLowerCase();
-            drops.push(
-              `    await sql\`DROP TABLE IF EXISTS "${junctionTableName}" CASCADE\`;\n    logger.info?.('Dropped table if exists: ${junctionTableName}');`,
-            );
-          }
-        }
-      }
-    }
-
-    // Then drop main tables in reverse dependency order
-    const sortedModels = this.sortModelsByDependencies().reverse();
-    for (const model of sortedModels) {
-      const tableName = model.tableName;
-      drops.push(
-        `    await sql\`DROP TABLE IF EXISTS ${this.tableRef(model)} CASCADE\`;\n` +
-          `    logger.info?.('Dropped table if exists: ${tableName}');`,
-      );
-    }
-
-    return drops.join('\n');
-  }
-
-  /**
-   * Sort models by their dependencies
-   */
-  private sortModelsByDependencies(): ModelDefinition[] {
-    const graph = new Map<string, Set<string>>();
-    const temp = new Set<string>();
-    const visited = new Set<string>();
-    const ordered: string[] = [];
-
-    // Build dependency graph: model -> set(dependencies it references)
-    for (const model of this.models) {
-      const modelName = model.name.toLowerCase();
-      if (!graph.has(modelName)) graph.set(modelName, new Set());
-      for (const field of model.fields) {
-        if (field.references) {
-          const ref = field.references.model.toLowerCase();
-          // ignore self-references
-          if (ref !== modelName) graph.get(modelName)!.add(ref);
-        }
-      }
-    }
-
-    // DFS visit ensures deps are added before the model
-    const visit = (name: string) => {
-      if (visited.has(name)) return;
-      if (temp.has(name)) {
-        // cycle detected; break it by returning (self/circular deps handled)
-        return;
-      }
-      temp.add(name);
-      const deps = graph.get(name) || new Set();
-      for (const d of deps) visit(d);
-      temp.delete(name);
-      visited.add(name);
-      ordered.push(name); // push after deps so deps come first
-    };
-
-    for (const model of this.models) visit(model.name.toLowerCase());
-
-    // Map back to ModelDefinition in correct order
-    const modelByName = new Map(this.models.map((m) => [m.name.toLowerCase(), m] as const));
-    return ordered.map((n) => modelByName.get(n)!).filter(Boolean);
-  }
-
-  /**
-   * Generate SQL statements for junction table creation
-   */
-  private generateJunctionTableCreationSQL(): string {
-    const junctionTables: string[] = [];
-    const processedJunctions = new Set<string>();
-
-    for (const model of this.models) {
-      if (!model.relationships) continue;
-
-      for (const rel of model.relationships) {
-        if (rel.type === 'manyToMany' && rel.through) {
-          // Avoid generating the same junction table twice
-          if (processedJunctions.has(rel.through)) continue;
-          processedJunctions.add(rel.through);
-
-          // Find the target model
-          const targetModel = this.models.find((m) => m.name === rel.target);
-          if (!targetModel) continue;
-
-          // Get primary key types
-          const sourcePK = model.fields.find((f) => f.primaryKey);
-          const targetPK = targetModel.fields.find((f) => f.primaryKey);
-
-          if (!sourcePK || !targetPK) continue;
-
-          // Get the SQL types for the foreign key columns
-          const sourceFKType = this.getColumnType(sourcePK).replace(' PRIMARY KEY', '').replace(' NOT NULL', '');
-          const targetFKType = this.getColumnType(targetPK).replace(' PRIMARY KEY', '').replace(' NOT NULL', '');
-
-          // Generate the junction table name and columns
-          const tableName = rel.through.toLowerCase();
-          const sourceFKColumn = rel.foreignKey || toSnakeCase(model.name) + '_id';
-          const targetFKColumn = rel.targetForeignKey || toSnakeCase(rel.target) + '_id';
-
-          let tableSQL = `    await sql\`
-      CREATE TABLE IF NOT EXISTS "${tableName}" (
-        ${sourceFKColumn} ${sourceFKType} NOT NULL,
-        ${targetFKColumn} ${targetFKType} NOT NULL`;
-
-          // Add timestamps if enabled (stored as EPOCH milliseconds - bigint)
-          const hasTimestamps = model.timestamps || targetModel.timestamps;
-          if (hasTimestamps) {
-            tableSQL += `,
-        created_at INT8 DEFAULT (extract(epoch from now()) * 1000)::bigint NOT NULL`;
-          }
-
-          tableSQL += `,
-        PRIMARY KEY (${sourceFKColumn}, ${targetFKColumn})
-      );\`;
-    logger.info?.('Created junction table: ${tableName}');`;
-
-          junctionTables.push(tableSQL);
-
-          // Add indexes for the foreign keys
-          const indexSQL = `    // Create indexes for ${tableName}
-    await sql\`CREATE INDEX IF NOT EXISTS idx_${tableName}_${sourceFKColumn} ON "${tableName}"(${sourceFKColumn});\`;
-    await sql\`CREATE INDEX IF NOT EXISTS idx_${tableName}_${targetFKColumn} ON "${tableName}"(${targetFKColumn});\`;
-    logger.info?.('Created indexes for junction table: ${tableName}');`;
-
-          junctionTables.push(indexSQL);
-        }
-      }
-    }
-
-    return junctionTables.join('\n\n');
-  }
-
-  /**
-   * Generate SQL statements for table creation
-   */
-  private generateTableCreationSQL(): string {
-    const sortedModels = this.sortModelsByDependencies();
-    return sortedModels.map((model) => {
-      const tableName = model.tableName;
-      const columns = this.generateColumnsSQL(model);
-      const constraints = this.generateConstraintsSQL(model);
-
-      return `    await sql\`
-      CREATE TABLE IF NOT EXISTS ${this.tableRef(model)} (
-        ${columns}${constraints ? ',\n        ' + constraints : ''}
-      );\`;
-    logger.info?.('Created table: ${tableName}');`;
-    }).join('\n\n');
-  }
-
-  /**
-   * Generate column definitions for a table
-   */
-  private generateColumnsSQL(model: ModelDefinition): string {
-    const columns = [];
-
-    // Model-specific columns
-    for (const field of model.fields) {
-      if (field.primaryKey) {
-        // Primary key field
-        if (field.type === 'uuid') {
-          columns.push(
-            `${field.name} UUID PRIMARY KEY${field.defaultValue ? ` DEFAULT ${field.defaultValue}` : ''} NOT NULL`,
-          );
-        } else {
-          columns.push(`${field.name} ${this.getColumnType(field)} PRIMARY KEY NOT NULL`);
-        }
-        continue;
-      }
-
-      const columnName = toSnakeCase(field.name);
-      const columnType = this.getColumnType(field);
-      const constraints = this.getColumnConstraints(field);
-      columns.push(`"${columnName}" ${columnType}${constraints}`);
-    }
-
-    // Common columns (timestamps stored as EPOCH milliseconds - bigint)
-    if (model.timestamps !== false) {
-      const timestampType = 'INT8'; // bigint for EPOCH milliseconds
-      const defaultValue = '(extract(epoch from now()) * 1000)::bigint';
-      columns.push(`created_at ${timestampType} DEFAULT ${defaultValue} NOT NULL`);
-      columns.push(`updated_at ${timestampType} DEFAULT ${defaultValue} NOT NULL`);
-    }
-
-    // Soft-delete column (nullable, no default)
-    const softDeleteColumn = getSoftDeleteColumn(model);
-    if (softDeleteColumn) {
-      columns.push(`${softDeleteColumn} INT8`);
-    }
-
-    return columns.join(',\n        ');
-  }
-
-  /**
-   * Generate constraints for a table (excluding foreign key constraints)
-   */
-  private generateConstraintsSQL(model: ModelDefinition): string {
-    const constraints = [];
-
-    // Unique constraints (suppressed for soft-delete models; they use partial unique indexes instead)
-    const sdCol = getSoftDeleteColumn(model);
-    for (const field of model.fields) {
-      if (field.unique && !sdCol) {
-        const columnName = toSnakeCase(field.name);
-        constraints.push(`CONSTRAINT "${model.name.toLowerCase()}_${columnName}_unique" UNIQUE("${columnName}")`);
-      }
-    }
-
-    // Foreign key constraints are now added separately after all tables are created
-    // This avoids circular dependency issues
-
-    return constraints.join(',\n        ');
-  }
-
-  /**
-   * Generate SQL statements for foreign key constraint creation
-   */
-  private generateForeignKeyConstraintsSQL(): string {
-    const constraints: string[] = [];
-
-    // Add FK constraints for main tables
-    for (const model of this.models) {
-      for (const field of model.fields) {
-        if (field.references) {
-          const columnName = toSnakeCase(field.name);
-          const refTable = this.referencedTableRef(field.references.model);
-          const refColumn = field.references.field || 'id';
-          const onDelete = field.references.onDelete || 'NO ACTION';
-          const onUpdate = field.references.onUpdate || 'NO ACTION';
-          const constraintName = `${model.name.toLowerCase()}_${columnName}_fk`;
-
-          constraints.push(
-            `    await sql\`ALTER TABLE ${this.tableRef(model)} ` +
-              `ADD CONSTRAINT "${constraintName}" ` +
-              `FOREIGN KEY ("${columnName}") REFERENCES ${refTable}("${refColumn}") ` +
-              `ON DELETE ${onDelete} ON UPDATE ${onUpdate};\`;\n` +
-              `    logger.info?.('Added FK constraint: ${constraintName}');`,
-          );
-        }
-      }
-    }
-
-    // Add FK constraints for junction tables
-    const processedJunctions = new Set<string>();
-    for (const model of this.models) {
-      if (!model.relationships) continue;
-
-      for (const rel of model.relationships) {
-        if (rel.type === 'manyToMany' && rel.through) {
-          if (processedJunctions.has(rel.through)) continue;
-          processedJunctions.add(rel.through);
-
-          const targetModel = this.models.find((m) => m.name === rel.target);
-          if (!targetModel) continue;
-
-          const sourcePK = model.fields.find((f) => f.primaryKey);
-          const targetPK = targetModel.fields.find((f) => f.primaryKey);
-          if (!sourcePK || !targetPK) continue;
-
-          const tableName = rel.through.toLowerCase();
-          const sourceFKColumn = rel.foreignKey || toSnakeCase(model.name) + '_id';
-          const targetFKColumn = rel.targetForeignKey || toSnakeCase(rel.target) + '_id';
-
-          // Add FK constraint for source table
-          constraints.push(
-            `    await sql\`ALTER TABLE "${tableName}" ` +
-              `ADD CONSTRAINT "${tableName}_${sourceFKColumn}_fk" ` +
-              `FOREIGN KEY (${sourceFKColumn}) REFERENCES ${this.tableRef(model)}(${sourcePK.name}) ` +
-              `ON DELETE CASCADE;\`;\n` +
-              `    logger.info?.('Added FK constraint: ${tableName}_${sourceFKColumn}_fk');`,
-          );
-
-          // Add FK constraint for target table
-          constraints.push(
-            `    await sql\`ALTER TABLE "${tableName}" ` +
-              `ADD CONSTRAINT "${tableName}_${targetFKColumn}_fk" ` +
-              `FOREIGN KEY (${targetFKColumn}) REFERENCES ${this.tableRef(targetModel)}(${targetPK.name}) ` +
-              `ON DELETE CASCADE;\`;\n` +
-              `    logger.info?.('Added FK constraint: ${tableName}_${targetFKColumn}_fk');`,
-          );
-        }
-      }
-    }
-
-    return constraints.join('\n\n');
-  }
-
-  /**
-   * Generate SQL statements for index creation
-   */
-  private generateIndexCreationSQL(): string {
-    // Index names only have to be unique within a schema, so the key includes the table
-    const processedIndexes = new Set<string>();
-    return this.models.map((model) => {
-      const indexes = this.generateIndexes(model);
-
-      if (!indexes.length) return '';
-
-      return indexes.map(({ sql, name }) => {
-        const key = `${this.tableRef(model)}:${name}`;
-        if (processedIndexes.has(key)) return '';
-        processedIndexes.add(key);
-        return `    await sql\`${sql}\`;
-    logger.info?.('Created index: ${name}');`;
-      }).filter(Boolean).join('\n');
-    }).filter(Boolean).join('\n\n');
-  }
-
-  /**
-   * Generate indexes for a table
-   */
-  private generateIndexes(model: ModelDefinition): Array<{ sql: string; name: string }> {
-    const indexes = [];
-    const tableName = model.tableName;
-    const tableRef = this.tableRef(model);
-    const sdCol = getSoftDeleteColumn(model);
-
-    // Field-level indexes
-    for (const field of model.fields) {
-      if (field.index) {
-        const columnName = toSnakeCase(field.name);
-        const method = this.getIndexMethod(field);
-        const methodClause = method ? `USING ${method}` : '';
-        const indexName = `idx_${tableName}_${columnName}`;
-
-        // For soft-delete models suppress the UNIQUE keyword here: the dedicated partial-unique-index
-        // loop below already emits a correct `WHERE deleted_at IS NULL` unique index for this column.
-        // A plain non-partial UNIQUE INDEX would let soft-deleted rows reserve the value — defeating the fix.
-        const createType = field.unique && !sdCol ? 'CREATE UNIQUE INDEX' : 'CREATE INDEX';
-        indexes.push({
-          name: indexName,
-          sql: `${createType} IF NOT EXISTS "${indexName}" ON ${tableRef} ` +
-            `${methodClause} ("${columnName}")`,
-        });
-      }
-    }
-
-    // Soft-delete: field-level unique becomes a partial unique index over live rows
-    if (sdCol) {
-      for (const field of model.fields) {
-        if (field.unique) {
-          const columnName = toSnakeCase(field.name);
-          const indexName = `uq_${tableName}_${columnName}`;
-          indexes.push({
-            name: indexName,
-            sql: `CREATE UNIQUE INDEX IF NOT EXISTS "${indexName}" ON ${tableRef} ` +
-              `("${columnName}") WHERE ${sdCol} IS NULL`,
-          });
-        }
-      }
-    }
-
-    // Model-level indexes
-    if (model.indexes) {
-      for (const idx of model.indexes) {
-        const columns = idx.fields.map((f) => `"${toSnakeCase(f)}"`).join(', ');
-        const indexName = idx.name || `idx_${tableName}_${idx.fields.map((f) => toSnakeCase(f)).join('_')}`;
-
-        // Determine index method, respecting postgis setting
-        let method = idx.type || this.getDefaultIndexMethod();
-
-        // If PostGIS is disabled and index type is GIST, fall back to GIN for JSONB
-        if (!this.postgis && method.toUpperCase() === 'GIST') {
-          method = 'GIN';
-        }
-
-        const methodClause = method ? `USING ${method}` : '';
-
-        const createType = idx.unique ? 'CREATE UNIQUE INDEX' : 'CREATE INDEX';
-        const partialClause = idx.unique && sdCol ? ` WHERE ${sdCol} IS NULL` : '';
-        indexes.push({
-          name: indexName,
-          sql: `${createType} IF NOT EXISTS "${indexName}" ON ${tableRef} ` +
-            `${methodClause} (${columns})${partialClause}`,
-        });
-      }
-    }
-
-    return indexes;
-  }
-
-  /**
-   * Get SQL type for a field
-   */
-  private getColumnType(field: FieldDefinition): string {
-    // Handle array types first
-    if (field.array) {
-      if (field.type === 'text') return 'TEXT[]';
-      const baseType = this.getColumnType({ ...field, array: false });
-      return `${baseType}[]`;
-    }
-
-    // Basic types that are the same in both PostgreSQL and CockroachDB
-    const commonTypes: Record<string, string> = {
-      'uuid': 'UUID',
-      'string': field.maxLength ? `VARCHAR(${field.maxLength})` : 'TEXT',
-      'text': 'TEXT',
-      'boolean': 'BOOLEAN',
-      'date': 'INT8', // Store dates as EPOCH milliseconds (bigint)
-      'jsonb': 'JSONB',
-      'timestamp': 'INT8', // Store timestamps as EPOCH milliseconds (bigint)
-    };
-
-    if (field.type in commonTypes) {
-      return commonTypes[field.type];
-    }
-
-    // Database-specific types
-    if (this.dbType === 'cockroachdb') {
-      switch (field.type) {
-        case 'integer':
-          return 'INT4';
-        case 'bigint':
-          return 'INT8';
-        case 'decimal':
-          return `DECIMAL(${field.precision || 10}, ${field.scale || 2})`;
-        case 'point':
-        case 'linestring':
-        case 'polygon':
-        case 'multipoint':
-        case 'multilinestring':
-        case 'multipolygon':
-        case 'geometry':
-        case 'geography': {
-          if (!this.postgis) {
-            return 'JSONB';
-          }
-          // CockroachDB doesn't support GEOGRAPHY type - convert to GEOMETRY
-          // For generic geometry/geography fields without specific geometryType, use GEOMETRY without subtype
-          if (field.geometryType) {
-            const srid = field.srid || 4326;
-            return `GEOMETRY(${field.geometryType}, ${srid})`;
-          } else if (field.type === 'geometry' || field.type === 'geography') {
-            // Generic geometry - use GEOMETRY without subtype specification
-            return 'GEOMETRY';
-          } else {
-            // Specific type (point, polygon, etc.)
-            const geometryType = field.type.toUpperCase();
-            const srid = field.srid || 4326;
-            return `GEOMETRY(${geometryType}, ${srid})`;
-          }
-        }
-        default:
-          return 'TEXT';
-      }
-    } else {
-      // PostgreSQL types
-      switch (field.type) {
-        case 'integer':
-          return 'INTEGER';
-        case 'bigint':
-          return 'BIGINT';
-        case 'decimal':
-          return `DECIMAL(${field.precision || 10}, ${field.scale || 2})`;
-        case 'point':
-        case 'linestring':
-        case 'polygon':
-        case 'multipoint':
-        case 'multilinestring':
-        case 'multipolygon':
-        case 'geometry':
-        case 'geography': {
-          if (!this.postgis) {
-            return 'JSONB';
-          }
-          // For generic geometry/geography fields without specific geometryType, use column type without subtype
-          if (field.geometryType) {
-            const srid = field.srid || 4326;
-            const isGeography = field.type === 'geography';
-            const columnType = isGeography ? 'GEOGRAPHY' : 'GEOMETRY';
-            return `${columnType}(${field.geometryType}, ${srid})`;
-          } else if (field.type === 'geometry') {
-            // Generic geometry - use GEOMETRY without subtype specification
-            return 'GEOMETRY';
-          } else if (field.type === 'geography') {
-            // Generic geography - use GEOGRAPHY without subtype specification
-            return 'GEOGRAPHY';
-          } else {
-            // Specific type (point, polygon, etc.)
-            const geometryType = field.type.toUpperCase();
-            const srid = field.srid || 4326;
-            return `GEOMETRY(${geometryType}, ${srid})`;
-          }
-        }
-        default:
-          return 'TEXT';
-      }
-    }
-  }
-
-  /**
-   * Get SQL constraints for a field
-   */
-  private getColumnConstraints(field: FieldDefinition): string {
-    const constraints = [];
-
-    if (field.required) {
-      constraints.push('NOT NULL');
-    }
-
-    if (field.defaultValue !== undefined) {
-      if (field.type === 'uuid' && field.defaultValue === 'gen_random_uuid()') {
-        constraints.push(`DEFAULT gen_random_uuid()`);
-      } else if (typeof field.defaultValue === 'string' && !field.defaultValue.includes('(')) {
-        constraints.push(`DEFAULT '${field.defaultValue}'`);
-      } else if (typeof field.defaultValue === 'boolean') {
-        constraints.push(`DEFAULT ${field.defaultValue}`);
-      } else if (typeof field.defaultValue === 'number') {
-        constraints.push(`DEFAULT ${field.defaultValue}`);
-      } else if (field.defaultValue === null) {
-        constraints.push('DEFAULT NULL');
-      } else {
-        constraints.push(`DEFAULT ${field.defaultValue}`);
-      }
-    }
-
-    return constraints.length ? ' ' + constraints.join(' ') : '';
-  }
-
-  /**
-   * Get index method based on field type
-   */
-  private getIndexMethod(field: FieldDefinition): string {
-    // CockroachDB only supports BTREE and INVERTED indexes
-    if (this.dbType === 'cockroachdb') {
-      if (field.type === 'json' || field.type === 'jsonb') {
-        return 'INVERTED';
-      }
-      return this.postgis && ['point', 'polygon', 'multipolygon', 'linestring'].includes(field.type) ? 'GIST' : 'BTREE';
-    }
-
-    // PostgreSQL index types
-    if (this.postgis && ['point', 'polygon', 'multipolygon', 'linestring'].includes(field.type)) {
-      return 'GIST';
-    }
-
-    if (field.type === 'json' || field.type === 'jsonb') {
-      return 'GIN';
-    }
-
-    return 'BTREE';
-  }
-
-  /**
-   * Get default index method for the database
-   */
-  private getDefaultIndexMethod(): string {
-    return this.dbType === 'cockroachdb' ? 'BTREE' : 'BTREE';
-  }
-
-  /**
-   * Format default value for SQL
-   */
-  private formatDefaultValue(field: FieldDefinition): string {
-    if (field.type === 'uuid' && field.defaultValue === 'gen_random_uuid()') {
-      return 'gen_random_uuid()';
-    } else if (typeof field.defaultValue === 'string' && !field.defaultValue.includes('(')) {
-      return `'${field.defaultValue}'`;
-    } else if (typeof field.defaultValue === 'boolean') {
-      return field.defaultValue.toString().toUpperCase();
-    } else if (typeof field.defaultValue === 'number') {
-      return field.defaultValue.toString();
-    } else if (field.defaultValue === null) {
-      return 'NULL';
-    } else {
-      return field.defaultValue?.toString() || '';
-    }
+  generateDrizzleConfig(): string {
+    const schemas = ['public', ...this.customSchemas()].map((schema) => `'${schema}'`).join(', ');
+    const extensionsFilter = this.requiresPostGISExtension() ? `\n  extensionsFilters: ['postgis'],` : '';
+
+    return `import { defineConfig } from 'drizzle-kit';
+
+/**
+ * drizzle-kit reads this file with its own loader, so it uses process.env rather than a Deno
+ * specific dotenv import. Pass the connection string as DB_URL, for example with
+ * \`deno run -A --env-file=.env npm:drizzle-kit push\`.
+ */
+export default defineConfig({
+  dialect: 'postgresql',
+  schema: '${this.outputPath}/schema/index.ts',
+  out: './drizzle',
+  dbCredentials: { url: process.env.DB_URL ?? '' },
+  schemaFilter: [${schemas}],${extensionsFilter}
+});
+`;
   }
 }

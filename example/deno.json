@@ -6,6 +6,7 @@
     "@std/crypto": "jsr:@std/crypto@^1.1.0",
     "@std/dotenv": "jsr:@std/dotenv@^0.225.8",
     "@std/path": "jsr:@std/path@^1.1.6",
+    "drizzle-kit": "npm:drizzle-kit@^0.31.10",
     "drizzle-orm": "npm:drizzle-orm@^0.45.2",
     "drizzle-zod": "npm:drizzle-zod@^0.8.3",
     "openapi-types": "npm:openapi-types@^12.1.3",
@@ -18,12 +19,15 @@
   "tasks": {
     "cog:crdb:generate": "deno run -A ../src/cli.ts --modelsPath ./models --outputPath ./generated --dbType cockroachdb",
     "cog:psql:generate": "deno run -A ../src/cli.ts --modelsPath ./models --outputPath ./generated --dbType postgresql",
-    "db:init": "deno run -A ./db-init.ts",
+    "db:bootstrap": "deno run -A --env-file=.env ./generated/db/bootstrap.ts",
+    "drizzle:push": "deno task db:bootstrap && deno run -A --env-file=.env npm:drizzle-kit push --force --config=./generated/drizzle.config.ts",
+    "drizzle:generate": "deno run -A --env-file=.env npm:drizzle-kit generate --config=./generated/drizzle.config.ts",
+    "drizzle:migrate": "deno task db:bootstrap && deno run -A --env-file=.env npm:drizzle-kit migrate --config=./generated/drizzle.config.ts",
     "db:clean": "deno run -A ./db-clean.ts",
     "fmt": "deno fmt --ignore=generated",
     "fmt:check": "deno fmt --ignore=generated --check",
-    "lint": "deno lint db-init.ts db-clean.ts src/ test/ && deno lint generated/ --rules-exclude=no-unused-vars",
-    "check": "deno check db-init.ts db-clean.ts src/ test/ generated/",
+    "lint": "deno lint db-clean.ts src/ test/ && deno lint generated/ --rules-exclude=no-unused-vars",
+    "check": "deno check db-clean.ts src/ test/ generated/",
     "test:integration": "deno test -A --filter integration --coverage=cov/ test/integration.test.ts",
     "cov": "deno coverage --lcov cov/ > lcov.info"
   }
