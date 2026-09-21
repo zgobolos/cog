@@ -1,5 +1,5 @@
 import { FieldDefinition, ModelDefinition } from '../types/model.types.ts';
-import { getSoftDeleteColumn, modelsHavePostGISFields } from '../utils/field.utils.ts';
+import { getCustomSchema, getSoftDeleteColumn, modelsHavePostGISFields } from '../utils/field.utils.ts';
 import { toSnakeCase } from '../utils/string.utils.ts';
 
 /**
@@ -29,6 +29,7 @@ export class DatabaseInitGenerator {
    * Generate database initialization script
    */
   generateDatabaseInitialization(): string {
+    const createSchemas = this.generateSchemaCreationSQL();
     const createPostgis = this.requiresPostGISExtension
       ? "\n    // Create PostGIS extension\n    await sql`CREATE EXTENSION IF NOT EXISTS postgis`;\n    logger.info?.('PostGIS extension created');"
       : '';
@@ -53,6 +54,7 @@ export async function initializeDatabase(config: DatabaseConfig) {
     const sql = getSQL();
     const logger = getLogger();
 ${createPostgis}
+${createSchemas}
 
     // Drop existing tables (in reverse dependency order)
 ${this.generateTableDropSQL()}
@@ -350,6 +352,44 @@ export async function healthCheck(): Promise<boolean> {
   }
 
   /**
+   * Table reference for DDL, schema-qualified unless the model lives in Postgres' default
+   * schema. Mirrors the pgTable()/pgSchema() choice of the Drizzle schema generator - the two
+   * must agree or the ORM queries a table the DDL never created.
+   */
+  private tableRef(model: ModelDefinition): string {
+    const tableName = model.tableName || model.name.toLowerCase();
+    const schema = getCustomSchema(model);
+    return schema ? `"${schema}"."${tableName}"` : `"${tableName}"`;
+  }
+
+  /**
+   * Table reference of a referenced model, looked up by model name.
+   * Falls back to the snake_cased model name when the target is unknown.
+   */
+  private referencedTableRef(modelName: string): string {
+    const model = this.models.find((m) => m.name === modelName);
+    return model ? this.tableRef(model) : `"${toSnakeCase(modelName)}"`;
+  }
+
+  /**
+   * Generate CREATE SCHEMA statements for every non-default schema the models use
+   */
+  private generateSchemaCreationSQL(): string {
+    const schemas = [
+      ...new Set(this.models.map(getCustomSchema).filter((schema): schema is string => schema !== null)),
+    ].sort();
+
+    if (schemas.length === 0) return '';
+
+    const statements = schemas.map((schema) =>
+      `    await sql\`CREATE SCHEMA IF NOT EXISTS "${schema}"\`;\n` +
+      `    logger.info?.('Created schema if not exists: ${schema}');`
+    );
+
+    return `\n    // Create non-default schemas\n${statements.join('\n')}`;
+  }
+
+  /**
    * Generate SQL statements for dropping tables
    */
   private generateTableDropSQL(): string {
@@ -377,7 +417,8 @@ export async function healthCheck(): Promise<boolean> {
     for (const model of sortedModels) {
       const tableName = model.tableName;
       drops.push(
-        `    await sql\`DROP TABLE IF EXISTS "${tableName}" CASCADE\`;\n    logger.info?.('Dropped table if exists: ${tableName}');`,
+        `    await sql\`DROP TABLE IF EXISTS ${this.tableRef(model)} CASCADE\`;\n` +
+          `    logger.info?.('Dropped table if exists: ${tableName}');`,
       );
     }
 
@@ -507,7 +548,7 @@ export async function healthCheck(): Promise<boolean> {
       const constraints = this.generateConstraintsSQL(model);
 
       return `    await sql\`
-      CREATE TABLE IF NOT EXISTS "${tableName}" (
+      CREATE TABLE IF NOT EXISTS ${this.tableRef(model)} (
         ${columns}${constraints ? ',\n        ' + constraints : ''}
       );\`;
     logger.info?.('Created table: ${tableName}');`;
@@ -586,21 +627,19 @@ export async function healthCheck(): Promise<boolean> {
 
     // Add FK constraints for main tables
     for (const model of this.models) {
-      const tableName = model.tableName;
-
       for (const field of model.fields) {
         if (field.references) {
           const columnName = toSnakeCase(field.name);
-          const refTable = toSnakeCase(field.references.model);
+          const refTable = this.referencedTableRef(field.references.model);
           const refColumn = field.references.field || 'id';
           const onDelete = field.references.onDelete || 'NO ACTION';
           const onUpdate = field.references.onUpdate || 'NO ACTION';
           const constraintName = `${model.name.toLowerCase()}_${columnName}_fk`;
 
           constraints.push(
-            `    await sql\`ALTER TABLE "${tableName}" ` +
+            `    await sql\`ALTER TABLE ${this.tableRef(model)} ` +
               `ADD CONSTRAINT "${constraintName}" ` +
-              `FOREIGN KEY ("${columnName}") REFERENCES "${refTable}"("${refColumn}") ` +
+              `FOREIGN KEY ("${columnName}") REFERENCES ${refTable}("${refColumn}") ` +
               `ON DELETE ${onDelete} ON UPDATE ${onUpdate};\`;\n` +
               `    logger.info?.('Added FK constraint: ${constraintName}');`,
           );
@@ -633,9 +672,8 @@ export async function healthCheck(): Promise<boolean> {
           constraints.push(
             `    await sql\`ALTER TABLE "${tableName}" ` +
               `ADD CONSTRAINT "${tableName}_${sourceFKColumn}_fk" ` +
-              `FOREIGN KEY (${sourceFKColumn}) REFERENCES "${
-                toSnakeCase(model.name)
-              }"(${sourcePK.name}) ON DELETE CASCADE;\`;\n` +
+              `FOREIGN KEY (${sourceFKColumn}) REFERENCES ${this.tableRef(model)}(${sourcePK.name}) ` +
+              `ON DELETE CASCADE;\`;\n` +
               `    logger.info?.('Added FK constraint: ${tableName}_${sourceFKColumn}_fk');`,
           );
 
@@ -643,9 +681,8 @@ export async function healthCheck(): Promise<boolean> {
           constraints.push(
             `    await sql\`ALTER TABLE "${tableName}" ` +
               `ADD CONSTRAINT "${tableName}_${targetFKColumn}_fk" ` +
-              `FOREIGN KEY (${targetFKColumn}) REFERENCES "${
-                toSnakeCase(targetModel.name)
-              }"(${targetPK.name}) ON DELETE CASCADE;\`;\n` +
+              `FOREIGN KEY (${targetFKColumn}) REFERENCES ${this.tableRef(targetModel)}(${targetPK.name}) ` +
+              `ON DELETE CASCADE;\`;\n` +
               `    logger.info?.('Added FK constraint: ${tableName}_${targetFKColumn}_fk');`,
           );
         }
@@ -659,16 +696,17 @@ export async function healthCheck(): Promise<boolean> {
    * Generate SQL statements for index creation
    */
   private generateIndexCreationSQL(): string {
-    const processedIndexes = new Set(); // Track unique index names
+    // Index names only have to be unique within a schema, so the key includes the table
+    const processedIndexes = new Set<string>();
     return this.models.map((model) => {
-      const _tableName = model.tableName;
       const indexes = this.generateIndexes(model);
 
       if (!indexes.length) return '';
 
       return indexes.map(({ sql, name }) => {
-        if (processedIndexes.has(name)) return '';
-        processedIndexes.add(name);
+        const key = `${this.tableRef(model)}:${name}`;
+        if (processedIndexes.has(key)) return '';
+        processedIndexes.add(key);
         return `    await sql\`${sql}\`;
     logger.info?.('Created index: ${name}');`;
       }).filter(Boolean).join('\n');
@@ -681,6 +719,7 @@ export async function healthCheck(): Promise<boolean> {
   private generateIndexes(model: ModelDefinition): Array<{ sql: string; name: string }> {
     const indexes = [];
     const tableName = model.tableName;
+    const tableRef = this.tableRef(model);
     const sdCol = getSoftDeleteColumn(model);
 
     // Field-level indexes
@@ -697,7 +736,7 @@ export async function healthCheck(): Promise<boolean> {
         const createType = field.unique && !sdCol ? 'CREATE UNIQUE INDEX' : 'CREATE INDEX';
         indexes.push({
           name: indexName,
-          sql: `${createType} IF NOT EXISTS "${indexName}" ON "${tableName}" ` +
+          sql: `${createType} IF NOT EXISTS "${indexName}" ON ${tableRef} ` +
             `${methodClause} ("${columnName}")`,
         });
       }
@@ -711,7 +750,7 @@ export async function healthCheck(): Promise<boolean> {
           const indexName = `uq_${tableName}_${columnName}`;
           indexes.push({
             name: indexName,
-            sql: `CREATE UNIQUE INDEX IF NOT EXISTS "${indexName}" ON "${tableName}" ` +
+            sql: `CREATE UNIQUE INDEX IF NOT EXISTS "${indexName}" ON ${tableRef} ` +
               `("${columnName}") WHERE ${sdCol} IS NULL`,
           });
         }
@@ -738,7 +777,7 @@ export async function healthCheck(): Promise<boolean> {
         const partialClause = idx.unique && sdCol ? ` WHERE ${sdCol} IS NULL` : '';
         indexes.push({
           name: indexName,
-          sql: `${createType} IF NOT EXISTS "${indexName}" ON "${tableName}" ` +
+          sql: `${createType} IF NOT EXISTS "${indexName}" ON ${tableRef} ` +
             `${methodClause} (${columns})${partialClause}`,
         });
       }

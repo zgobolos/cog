@@ -169,6 +169,14 @@ OpenAPI spec is built dynamically from metadata at runtime:
 }
 ```
 
+**`schema`**: `"public"` and an omitted value both mean Postgres' default schema (`getCustomSchema` in
+`src/utils/field.utils.ts` is the shared rule — drizzle-orm >=0.45 forbids `pgSchema('public')`). Any other value is
+emitted as `CREATE SCHEMA IF NOT EXISTS` and qualifies every DDL statement of the model: `CREATE TABLE`, `DROP TABLE`,
+`CREATE INDEX ... ON`, `ALTER TABLE` and the `REFERENCES` target of incoming foreign keys. The DDL side and the Drizzle
+`pgSchema()` wrapper must stay in agreement — an unqualified `CREATE TABLE` puts the table in the default schema while
+the ORM queries the declared one. Junction tables are always created in the default schema, mirroring their `pgTable()`
+definition.
+
 ## Data Types
 
 | Category   | Types                                                                                                      |

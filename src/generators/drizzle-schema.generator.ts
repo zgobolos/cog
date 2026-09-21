@@ -1,5 +1,6 @@
 import { FieldDefinition, IndexDefinition, ModelDefinition, RelationshipDefinition } from '../types/model.types.ts';
 import {
+  getCustomSchema,
   getSoftDeleteColumn,
   hasPostGISFields,
   modelsHavePostGISFields,
@@ -94,7 +95,7 @@ export class DrizzleSchemaGenerator {
 
     // Add table import
     drizzleImports.add('pgTable');
-    if (this.customSchema(model)) {
+    if (getCustomSchema(model)) {
       drizzleImports.add('pgSchema');
     }
 
@@ -226,16 +227,6 @@ export class DrizzleSchemaGenerator {
   }
 
   /**
-   * Returns the schema name to wrap in pgSchema(), or null for the default
-   * schema. "public" is Postgres' default schema and drizzle-orm (>=0.45)
-   * forbids pgSchema('public'), so models on "public" (or with no schema) use
-   * pgTable() directly.
-   */
-  private customSchema(model: ModelDefinition): string | null {
-    return model.schema && model.schema !== 'public' ? model.schema : null;
-  }
-
-  /**
    * Generate table definition
    */
   private generateTableDefinition(model: ModelDefinition): string {
@@ -243,7 +234,7 @@ export class DrizzleSchemaGenerator {
 
     // Handle schema if specified. "public" is Postgres' default schema, and
     // drizzle-orm (>=0.45) forbids pgSchema('public') — use pgTable() directly.
-    const customSchema = this.customSchema(model);
+    const customSchema = getCustomSchema(model);
     if (customSchema) {
       code += `const ${customSchema}Schema = pgSchema('${customSchema}');\n\n`;
     }

@@ -801,3 +801,68 @@ Deno.test('generator - dependency contract is in sync across docs and example', 
     assertEquals(exampleConfig.imports[name], specifier, `example/deno.json must pin ${name} as ${specifier}`);
   }
 });
+
+const SCHEMA_DDL_MODELS = './test/test-schema-ddl-models';
+const SCHEMA_DDL_OUTPUT = './test/test-schema-ddl-generated';
+
+async function cleanupSchemaDDL() {
+  for (const p of [SCHEMA_DDL_MODELS, SCHEMA_DDL_OUTPUT]) {
+    try {
+      await Deno.remove(p, { recursive: true });
+    } catch { /* ignore */ }
+  }
+}
+
+// Regression: the Drizzle schema wraps a non-default schema in pgSchema(), so the DDL has to
+// create that schema and qualify every table reference with it. Unqualified DDL creates the
+// table in the default schema while the ORM queries the declared one.
+Deno.test('generator - DDL creates and qualifies a non-default schema', async () => {
+  await cleanupSchemaDDL();
+  try {
+    await Deno.mkdir(SCHEMA_DDL_MODELS, { recursive: true });
+    const owner = {
+      name: 'Owner',
+      tableName: 'owner',
+      fields: [
+        { name: 'id', type: 'uuid', primaryKey: true, defaultValue: 'gen_random_uuid()', required: true },
+        { name: 'name', type: 'string', maxLength: 100, required: true },
+      ],
+    };
+    const report = {
+      name: 'Report',
+      tableName: 'report',
+      schema: 'analytics',
+      fields: [
+        { name: 'id', type: 'uuid', primaryKey: true, defaultValue: 'gen_random_uuid()', required: true },
+        { name: 'title', type: 'string', maxLength: 100, required: true, index: true },
+        { name: 'ownerId', type: 'uuid', references: { model: 'Owner', field: 'id' } },
+      ],
+    };
+    await Deno.writeTextFile(`${SCHEMA_DDL_MODELS}/owner.json`, JSON.stringify(owner, null, 2));
+    await Deno.writeTextFile(`${SCHEMA_DDL_MODELS}/report.json`, JSON.stringify(report, null, 2));
+    await generateFromModels(SCHEMA_DDL_MODELS, SCHEMA_DDL_OUTPUT);
+
+    const init = await Deno.readTextFile(`${SCHEMA_DDL_OUTPUT}/db/initialize-database.ts`);
+
+    // The schema itself has to exist before the tables are created
+    assertEquals(init.includes('CREATE SCHEMA IF NOT EXISTS "analytics"'), true);
+    assertEquals(init.includes('CREATE SCHEMA IF NOT EXISTS "public"'), false);
+
+    // Every reference to the analytics table is qualified
+    assertEquals(init.includes('CREATE TABLE IF NOT EXISTS "analytics"."report"'), true);
+    assertEquals(init.includes('DROP TABLE IF EXISTS "analytics"."report" CASCADE'), true);
+    assertEquals(/ON "analytics"\."report"/.test(init), true);
+    assertEquals(/ALTER TABLE "analytics"\."report" .*REFERENCES "owner"\("id"\)/.test(init), true);
+
+    // A model on the default schema stays unqualified
+    assertEquals(init.includes('CREATE TABLE IF NOT EXISTS "owner"'), true);
+    assertEquals(init.includes('"public"."owner"'), false);
+
+    // ... and the Drizzle side still agrees with it
+    const reportSchema = await Deno.readTextFile(`${SCHEMA_DDL_OUTPUT}/schema/report.schema.ts`);
+    assertEquals(reportSchema.includes("pgSchema('analytics')"), true);
+    assertEquals(reportSchema.includes("analyticsSchema.table('report'"), true);
+  } finally {
+    await cleanupSchemaDDL();
+  }
+});

@@ -1250,6 +1250,37 @@ async function runTests(): Promise<void> {
   logSuccess('Soft delete behavior verified');
 
   // ========================================
+  // 18. NON-DEFAULT SCHEMA
+  // ========================================
+  logSection('18. Testing a Model in a Non-Default Schema');
+
+  // AdvancedDemo declares "schema": "analytics". The Drizzle table is wrapped in
+  // pgSchema('analytics'), so the DDL has to create the table there too - otherwise every
+  // request fails with 'relation "analytics.advanced_demo" does not exist'.
+  logStep('18.1 Create an AdvancedDemo record in the analytics schema');
+  const advanced = await POST('/api/advanceddemo', {
+    name: 'Schema Probe',
+    isActive: true,
+    optionalField1: 'first',
+    optionalField2: 2,
+  }) as Record<string, unknown>;
+  assertExists(advanced.id, 'advanced.id');
+
+  logStep('18.2 Read it back through the ORM');
+  const advancedRead = await GET(`/api/advanceddemo/${advanced.id}`) as Record<string, unknown>;
+  assertEquals(advancedRead.name, 'Schema Probe', 'record must be readable from the analytics schema');
+
+  logStep('18.3 Verify the table physically lives in the analytics schema');
+  const schemaRows = await rawSql`
+    SELECT table_schema FROM information_schema.tables WHERE table_name = 'advanced_demo'
+  `;
+  assertEquals(schemaRows.length, 1, 'advanced_demo must exist exactly once');
+  assertEquals(schemaRows[0].table_schema, 'analytics', 'advanced_demo must live in the analytics schema');
+
+  await DELETE(`/api/advanceddemo/${advanced.id}`);
+  logSuccess('✓ Non-default schema: DDL creates the table in analytics and CRUD works there');
+
+  // ========================================
   // SUCCESS
   // ========================================
   logSection('All Tests Passed!');

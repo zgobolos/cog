@@ -62,3 +62,12 @@ export const hasPostGISFields = (model: ModelDefinition): boolean => {
 export const modelsHavePostGISFields = (models: ModelDefinition[]): boolean => {
   return models.some(hasPostGISFields);
 };
+
+/**
+ * Returns the model's schema when it is not Postgres' default schema, otherwise null.
+ * "public" and an unset schema both mean the default: drizzle-orm (>=0.45) forbids
+ * pgSchema('public'), and DDL for the default schema stays unqualified.
+ */
+export const getCustomSchema = (model: ModelDefinition): string | null => {
+  return model.schema && model.schema !== 'public' ? model.schema : null;
+};

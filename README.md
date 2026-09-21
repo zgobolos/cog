@@ -389,6 +389,13 @@ Generates: `CHECK (num_nonnulls(field1, field2, field3) >= 2)`
 }
 ```
 
+A non-default schema is created by the initialization script (`CREATE SCHEMA IF NOT EXISTS "hr"`) and every DDL
+statement for the model is qualified with it — `CREATE TABLE "hr"."employee"`, its indexes, and both sides of its
+foreign keys. The Drizzle table is wrapped in `pgSchema('hr')` to match.
+
+`"public"` and an omitted `schema` both mean Postgres' default schema and stay unqualified. Junction tables of
+many-to-many relationships are always created in the default schema, even when the related models are not.
+
 ### Foreign Key Actions
 
 ```json
