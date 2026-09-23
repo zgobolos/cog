@@ -42,7 +42,7 @@ cog/
 │   └── db-clean.ts                         # Database cleanup script
 ├── .github/
 │   ├── workflows/ci.yml                    # CI pipeline (lint, check, test, coverage)
-│   └── hooks/pre-commit                    # Pre-commit hook script
+│   └── hooks/pre-commit                    # Pre-commit checks on a checkout of the index (never stages)
 ├── .vscode/                                # VSCode Deno configuration
 ├── deno.json                               # Root workspace config & tasks
 ├── AGENTS.md                               # This file

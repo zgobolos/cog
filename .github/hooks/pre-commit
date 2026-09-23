@@ -1,21 +1,34 @@
 #!/bin/sh
-# Pre-commit hook: format, lint, and type check
+# Pre-commit hook: formatting, lint and type checks of exactly what is being committed.
+#
+# The checks run on a temporary checkout of the index, not on the working tree, so an unstaged
+# change can neither hide a problem nor cause one: a commit passes only if its own content is
+# formatted, lints and type checks. The hook never modifies the commit or the working tree - when
+# formatting is off it fails; run `deno task fmt`, stage the result and commit again.
 
-set -e  # Exit on first error
+set -e # Exit on first error
 
-# Root: format, lint, check
-deno task fmt
+checkout=$(mktemp -d)
+cleanup() {
+  status=$?
+  rm -rf "$checkout"
+  if [ "$status" -ne 0 ]; then
+    echo "pre-commit: the staged content failed a check - the paths above point into a temporary checkout of the index." >&2
+    echo "pre-commit: fix it in the working tree (formatting: deno task fmt), stage the result and commit again." >&2
+  fi
+}
+trap cleanup EXIT
+git checkout-index --all --prefix="$checkout/"
+cd "$checkout"
+
+# Root: formatting, lint, types
+deno task fmt:check
 deno task lint
 deno task check
 
-# Example: regenerate from scratch, format, lint, check
+# Example: regenerate from the committed generator, then formatting, lint, types
 cd example
-rm -rf generated
 deno task cog:psql:generate
-deno task fmt
+deno task fmt:check
 deno task lint
 deno task check
-
-# Stage any formatting/generation changes
-cd ..
-git add -u

@@ -802,12 +802,15 @@ cd cog
 deno task setup:hooks
 ```
 
-The pre-commit hook automatically:
+The pre-commit hook checks exactly what is being committed. It runs on a temporary checkout of the index, so an unstaged
+change neither hides a problem nor causes one:
 
-1. Formats code in root and example directories
-2. Regenerates example code from models
+1. Checks formatting in the root and example directories
+2. Regenerates the example code from the models
 3. Runs lint and type checks
-4. Stages any formatting changes
+
+It never modifies the commit or the working tree. When formatting is off the commit fails: run `deno task fmt`, stage
+the result and commit again.
 
 ### Development Tasks
 
