@@ -322,7 +322,7 @@ export function handleDomainException(error: unknown, operation?: 'delete'): nev
       try {
         const id = c.req.param('id');
 
-        const result = await ${modelNameLower}Domain.get${RelName}(id);
+        const result = await ${modelNameLower}Domain.get${RelName}(id, undefined, {}, c.var);
 
         return c.json({ data: convertBigIntToNumber(result) });
       } catch (error) {

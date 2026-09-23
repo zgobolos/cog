@@ -211,7 +211,7 @@ export interface JunctionTableHooks<DomainEnvVars extends Record<string, unknown
 
     // Junction utility imports for many-to-many relationships
     const junctionUtilImports = hasManyToMany
-      ? `import { addJunctionWithHooks, removeJunctionWithHooks, addManyJunctions, removeManyJunctions, setJunctions, getJunctionTargets, hasJunction } from './junction.utils.ts';`
+      ? `import { addJunctionWithHooks, removeJunctionWithHooks, addManyJunctions, removeManyJunctions, setJunctions, hasJunction } from './junction.utils.ts';`
       : '';
 
     return `${drizzleImports}
@@ -675,7 +675,7 @@ export const ${modelNameLower}Domain = new ${modelName}Domain();
         code += `          // Load ${rel.name} (manyToOne) via domain\n`;
         code += `          if (found.${foreignKey}) {\n`;
         code +=
-          `            const ${rel.name} = await ${targetDomain}.findById(found.${foreignKey}, tx, { skipSanitization: options.skipSanitization });\n`;
+          `            const ${rel.name} = await ${targetDomain}.findById(found.${foreignKey}, tx, { skipSanitization: options.skipSanitization }, context);\n`;
         code += `            (found as unknown as Record<string, unknown>).${rel.name} = ${rel.name};\n`;
         code += `          } else {\n`;
         code += `            (found as unknown as Record<string, unknown>).${rel.name} = null;\n`;
@@ -687,7 +687,7 @@ export const ${modelNameLower}Domain = new ${modelName}Domain();
         code += `          const { data: ${rel.name} } = await ${targetDomain}.findMany(tx, {\n`;
         code += `            where: eq(${targetTable}.${foreignKey}, id),\n`;
         code += `            skipSanitization: options.skipSanitization\n`;
-        code += `          });\n`;
+        code += `          }, context);\n`;
         code += `          (found as unknown as Record<string, unknown>).${rel.name} = ${rel.name};\n`;
       } else if (rel.type === 'manyToMany' && rel.through) {
         // For manyToMany, get IDs from junction table then fetch via domain
@@ -704,7 +704,7 @@ export const ${modelNameLower}Domain = new ${modelName}Domain();
         code += `            const { data: ${rel.name} } = await ${targetDomain}.findMany(tx, {\n`;
         code += `              where: inArray(${targetTable}.id, ${rel.name}TargetIds),\n`;
         code += `              skipSanitization: options.skipSanitization\n`;
-        code += `            });\n`;
+        code += `            }, context);\n`;
         code += `            (found as unknown as Record<string, unknown>).${rel.name} = ${rel.name};\n`;
         code += `          } else {\n`;
         code += `            (found as unknown as Record<string, unknown>).${rel.name} = [];\n`;
@@ -718,7 +718,7 @@ export const ${modelNameLower}Domain = new ${modelName}Domain();
           code += `          // Load ${rel.name} (oneToOne - owned) via domain\n`;
           code += `          if (found.${foreignKey}) {\n`;
           code +=
-            `            const ${rel.name} = await ${targetDomain}.findById(found.${foreignKey}, tx, { skipSanitization: options.skipSanitization });\n`;
+            `            const ${rel.name} = await ${targetDomain}.findById(found.${foreignKey}, tx, { skipSanitization: options.skipSanitization }, context);\n`;
           code += `            (found as unknown as Record<string, unknown>).${rel.name} = ${rel.name};\n`;
           code += `          } else {\n`;
           code += `            (found as unknown as Record<string, unknown>).${rel.name} = null;\n`;
@@ -731,7 +731,7 @@ export const ${modelNameLower}Domain = new ${modelName}Domain();
           code += `            where: eq(${targetTable}.${foreignKey}, id),\n`;
           code += `            limit: 1,\n`;
           code += `            skipSanitization: options.skipSanitization\n`;
-          code += `          });\n`;
+          code += `          }, context);\n`;
           code += `          (found as unknown as Record<string, unknown>).${rel.name} = ${rel.name}List[0] || null;\n`;
         }
       }
@@ -775,7 +775,7 @@ export const ${modelNameLower}Domain = new ${modelName}Domain();
         code += `          const { data: ${rel.name}Data } = await ${targetDomain}.findMany(tx, {\n`;
         code += `            where: inArray(${targetTable}.id, ${rel.name}Ids),\n`;
         code += `            skipSanitization: options.skipSanitization\n`;
-        code += `          });\n`;
+        code += `          }, context);\n`;
         code += `          const ${rel.name}Map = new Map(${rel.name}Data.map(item => [item.id, item]));\n`;
         code += `          results.forEach(result => {\n`;
         code +=
@@ -794,7 +794,7 @@ export const ${modelNameLower}Domain = new ${modelName}Domain();
         code += `        const { data: ${rel.name}Data } = await ${targetDomain}.findMany(tx, {\n`;
         code += `          where: inArray(${targetTable}.${foreignKey}, resultIds),\n`;
         code += `          skipSanitization: options.skipSanitization\n`;
-        code += `        });\n`;
+        code += `        }, context);\n`;
         code += `        const ${rel.name}Map = new Map<string, unknown[]>();\n`;
         code += `        resultIds.forEach(id => ${rel.name}Map.set(id, []));\n`;
         code += `        ${rel.name}Data.forEach(item => {\n`;
@@ -825,7 +825,7 @@ export const ${modelNameLower}Domain = new ${modelName}Domain();
         code += `          const { data: ${rel.name}Data } = await ${targetDomain}.findMany(tx, {\n`;
         code += `            where: inArray(${targetTable}.id, ${rel.name}TargetIds),\n`;
         code += `            skipSanitization: options.skipSanitization\n`;
-        code += `          });\n`;
+        code += `          }, context);\n`;
         code += `          const ${rel.name}EntityMap = new Map(${rel.name}Data.map(item => [item.id, item]));\n`;
         code += `          const ${rel.name}Map = new Map<string, unknown[]>();\n`;
         code += `          resultIds.forEach(id => ${rel.name}Map.set(id, []));\n`;
@@ -858,7 +858,7 @@ export const ${modelNameLower}Domain = new ${modelName}Domain();
           code += `          const { data: ${rel.name}Data } = await ${targetDomain}.findMany(tx, {\n`;
           code += `            where: inArray(${targetTable}.id, ${rel.name}Ids),\n`;
           code += `            skipSanitization: options.skipSanitization\n`;
-          code += `          });\n`;
+          code += `          }, context);\n`;
           code += `          const ${rel.name}Map = new Map(${rel.name}Data.map(item => [item.id, item]));\n`;
           code += `          results.forEach(result => {\n`;
           code +=
@@ -877,7 +877,7 @@ export const ${modelNameLower}Domain = new ${modelName}Domain();
           code += `        const { data: ${rel.name}Data } = await ${targetDomain}.findMany(tx, {\n`;
           code += `          where: inArray(${targetTable}.${foreignKey}, resultIds),\n`;
           code += `          skipSanitization: options.skipSanitization\n`;
-          code += `        });\n`;
+          code += `        }, context);\n`;
           code += `        const ${rel.name}Map = new Map<string, unknown>();\n`;
           code += `        ${rel.name}Data.forEach(item => {\n`;
           code += `          const fkValue = (item as unknown as Record<string, unknown>).${foreignKey} as string;\n`;
@@ -948,34 +948,52 @@ export const ${modelNameLower}Domain = new ${modelName}Domain();
 
         // Junction config object for this relationship
         const junctionConfigVar = `${relName}JunctionConfig`;
-        const targetModel = this.models.find((m) => m.name === rel.target);
-        const targetHasSoftDelete = !!targetModel?.softDelete;
-        // drizzle keys innerJoin result rows by the SQL table name, so this must
-        // be the target's actual table name (snake_case), not the lowercased model name.
-        const targetTableSqlName = targetModel?.tableName || targetNameLower;
+        // The targets are read through their own domain; a self-reference uses this one
+        const targetDomain = rel.target === model.name ? 'this' : `${targetNameLower}Domain`;
+        const targetTable = `${(rel.target === model.name ? model.name : rel.target).toLowerCase()}Table`;
 
         methods.push(`
   // Junction config for ${relName}
   private ${junctionConfigVar} = {
     junctionTable: ${junctionTable}Table,
-    targetTable: ${targetNameLower}Table,
     sourceColumn: '${sourceFK}' as const,
     targetColumn: '${targetFK}' as const,
     sourceIdKey: '${toCamelCase(sourceFK)}',
     targetIdKey: '${toCamelCase(targetFK)}',
-    targetTableName: '${targetTableSqlName}',
-    targetHasSoftDelete: ${targetHasSoftDelete},
   };
 
   /**
    * Get ${relName} for ${model.name}
+   *
+   * The ${model.name} is read through its own find hooks first and must be visible (NotFoundException
+   * otherwise). The ${targetName} rows come through the ${targetName} domain, so its hooks run with the
+   * same context, and its exposure and soft-delete rules apply.
    */
-  async get${RelName}(id: string, tx?: DbTransaction): Promise<Array<${targetName}>> {
-    return await getJunctionTargets<typeof ${junctionTable}Table, typeof ${targetNameLower}Table, ${targetName}>(
-      this.${junctionConfigVar},
-      id,
-      tx,
-    );
+  async get${RelName}(
+    id: string,
+    tx?: DbTransaction,
+    options?: QueryOptions,
+    context?: DomainHookContext<DomainEnvVars>,
+  ): Promise<Array<${targetName}>> {
+    const parent = await this.findById(id, tx, {}, context);
+    if (!parent) {
+      throw new NotFoundException(\`${model.name} with id \${id} not found\`);
+    }
+
+    const junctionRows = await (tx || withoutTransaction())
+      .select({ targetId: ${junctionTable}Table.${targetFK} })
+      .from(${junctionTable}Table)
+      .where(eq(${junctionTable}Table.${sourceFK}, id));
+    const targetIds = junctionRows.map((row) => row.targetId);
+    if (targetIds.length === 0) {
+      return [];
+    }
+
+    const { data } = await ${targetDomain}.findMany(tx, {
+      where: inArray(${targetTable}.id, targetIds),
+      skipSanitization: options?.skipSanitization,
+    }, context);
+    return data;
   }
 
   /**

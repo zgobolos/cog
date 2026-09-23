@@ -339,6 +339,30 @@ export async function startServer(config: ServerConfig = {}): Promise<ServerHand
           },
         },
       },
+
+      // Models reached through relation includes: their find hooks record the context they receive
+      department: {
+        beforeFindById: (id: string, context?: DomainHookContext<ExampleEnv['Variables']>): Promise<string> => {
+          recordHook('department.beforeFindById', context);
+          return Promise.resolve(id);
+        },
+        beforeFindMany: (
+          options: QueryOptions,
+          context?: DomainHookContext<ExampleEnv['Variables']>,
+        ): Promise<QueryOptions> => {
+          recordHook('department.beforeFindMany', context);
+          return Promise.resolve(options);
+        },
+      },
+      skill: {
+        beforeFindMany: (
+          options: QueryOptions,
+          context?: DomainHookContext<ExampleEnv['Variables']>,
+        ): Promise<QueryOptions> => {
+          recordHook('skill.beforeFindMany', context);
+          return Promise.resolve(options);
+        },
+      },
     },
   });
 

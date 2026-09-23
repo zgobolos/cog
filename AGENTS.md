@@ -275,7 +275,11 @@ PUT    /:id/{relation}List   { "ids": [...] }      replace all
 DELETE /:id/{relation}List   { "ids": [...] }      remove several     DELETE /:id/{singular}   { "id": "..." }   remove one
 ```
 
-`{singular}` is the relation name without its `List` suffix. Both `DELETE` endpoints read a JSON body. Like the CRUD
+`{singular}` is the relation name without its `List` suffix. The list endpoint (`get<Relation>`) reads the parent with
+its own `findById` - `NotFoundException`/404 when it is not visible - then the junction rows, then the targets with the
+target domain's `findMany(tx, { where: inArray(<target>.id, ids) }, context)`: the target's hooks run with the request
+context, and its exposure and soft-delete rules apply. It used to join the target table directly, which bypassed both
+domains' hooks and returned the target's hidden fields. Both `DELETE` endpoints read a JSON body. Like the CRUD
 handlers, they pass the request context (`c.var`) to the domain, so junction hooks see it too.
 
 **Relationship endpoint configuration:**
@@ -458,7 +462,9 @@ Filters passed via `where` query parameter as base64-encoded JSON.
 shape. `buildWhereSQL` silently skips such a condition, which would widen the result - that is why validation comes
 first. Hidden columns are filtered with a drizzle `SQL` condition; `skipSanitization` only controls the stripping of the
 returned rows. Relation includes filter their targets with SQL (`eq`/`inArray` on the target table), never with
-`WhereFilter`s, so they do not depend on the exposure of a foreign key.
+`WhereFilter`s, so they do not depend on the exposure of a foreign key. Every include call hands the caller's `context`
+to the related domain (`findById(..., tx, options, context)`, `findMany(tx, options, context)`): the target's hooks -
+tenant scoping, for one - depend on it, and without it every include of a scoped model failed.
 
 ## Database Compatibility
 

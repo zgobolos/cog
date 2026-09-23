@@ -459,21 +459,27 @@ Deno.test('generator - soft delete column is hidden from OpenAPI', async () => {
   }
 });
 
-Deno.test('generator - m2m junction config flags soft-deletable target', async () => {
+Deno.test('generator - many-to-many list reads the targets through their domain', async () => {
   await cleanupM2M();
   try {
     await generateM2MSoftDelete();
     const domain = await Deno.readTextFile(`${M2M_OUTPUT}/domain/sdparent.domain.ts`);
-    assertEquals(domain.includes('targetHasSoftDelete: true'), true);
-    // targetTableName must be the SQL table name (how drizzle keys join results),
-    // not the lowercased model name. SdTag -> table "sd_tag".
-    assertEquals(domain.includes("targetTableName: 'sd_tag'"), true);
-    assertEquals(domain.includes("targetTableName: 'sdtag'"), false);
+    // The parent has to be visible through its own find hooks...
+    assertEquals(domain.includes('const parent = await this.findById(id, tx, {}, context);'), true);
+    // ...and the targets come through the target domain: its hooks, exposure and soft-delete rules
+    assertEquals(
+      /await sdtagDomain\.findMany\(tx, \{\s*where: inArray\(sdtagTable\.id, targetIds\),\s*skipSanitization: options\?\.skipSanitization,\s*\}, context\);/
+        .test(domain),
+      true,
+    );
+    // The direct join, which bypassed all of that and returned hidden fields, is gone
+    assertEquals(domain.includes('targetHasSoftDelete'), false);
+    assertEquals(domain.includes('getJunctionTargets'), false);
     const junction = await Deno.readTextFile(`${M2M_OUTPUT}/domain/junction.utils.ts`);
-    // getJunctionTargets honors the flag with an isNull filter on the target's deletedAt
-    assertEquals(junction.includes('targetHasSoftDelete'), true);
-    assertEquals(junction.includes("config.targetTable['deletedAt'"), true);
-    assertEquals(junction.includes('isNull('), true);
+    assertEquals(junction.includes('getJunctionTargets'), false);
+    // The REST endpoint hands the request context over
+    const rest = await Deno.readTextFile(`${M2M_OUTPUT}/rest/sdparent.rest.ts`);
+    assertEquals(rest.includes('sdparentDomain.getTagList(id, undefined, {}, c.var)'), true);
   } finally {
     await cleanupM2M();
   }
@@ -1182,6 +1188,20 @@ Deno.test('generator - hook registration, strict domain filters and exported exc
     assertEquals(authorDomain.includes('where: inArray(bookTable.authorId, resultIds)'), true);
     assertEquals(authorDomain.includes('where: inArray(genreTable.id, genreListTargetIds)'), true);
     assertEquals(/op: '(eq|in)', value/.test(authorDomain), false);
+
+    // ...and hand the request context to the related domain, whose hooks (tenant scoping) may need it
+    const bookDomain = await read('domain/book.domain.ts');
+    assertEquals(
+      bookDomain.includes(
+        'authorDomain.findById(found.authorId, tx, { skipSanitization: options.skipSanitization }, context)',
+      ),
+      true,
+    );
+    for (const file of [authorDomain, bookDomain]) {
+      // a related-domain call whose options object is not followed by the context
+      assertEquals(/Domain\.find(ById|Many)\([^;]*?\{[^}]*\}\);/.test(file), false);
+    }
+    assertEquals((authorDomain.match(/\}, context\);/g) ?? []).length >= 4, true);
 
     // The exceptions reach generated/index.ts through domain/index.ts
     assertEquals((await read('domain/index.ts')).includes("export * from './exceptions.ts';"), true);

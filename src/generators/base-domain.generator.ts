@@ -116,12 +116,13 @@ export abstract class BaseDomain<
 
   /**
    * Load relationships for a single result (findById)
-   * Override in subclass to handle relationship includes
+   * Override in subclass to handle relationship includes; pass the context on to the related domains
    */
   protected abstract loadRelationshipsForOne(
     result: T,
     options: QueryOptions,
     tx?: DbTransaction,
+    context?: DomainHookContext<DomainEnvVars>,
   ): Promise<T>;
 
   /**
@@ -132,6 +133,7 @@ export abstract class BaseDomain<
     results: T[],
     options: QueryOptions,
     tx?: DbTransaction,
+    context?: DomainHookContext<DomainEnvVars>,
   ): Promise<T[]>;
 
   // ============================================
@@ -228,7 +230,7 @@ export abstract class BaseDomain<
 
     // Load relationships if requested
     if (options?.include && options.include.length > 0 && found) {
-      found = await this.loadRelationshipsForOne(found, options, tx);
+      found = await this.loadRelationshipsForOne(found, options, tx, context);
     }
 
     // Post-find hook
@@ -314,7 +316,7 @@ export abstract class BaseDomain<
 
     // Load relationships if requested
     if (options?.include && options.include.length > 0 && results.length > 0) {
-      results = await this.loadRelationshipsForMany(results, options, tx);
+      results = await this.loadRelationshipsForMany(results, options, tx, context);
     }
 
     // Get total count

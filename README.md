@@ -707,15 +707,15 @@ helpers are all exported from `generated/index.ts`.
 
 A many-to-many relation adds methods named after it. For `skillList` on `Employee`, targeting `Skill`:
 
-| Method                                                  | Returns   | Effect                                        |
-| ------------------------------------------------------- | --------- | --------------------------------------------- |
-| `getSkillList(id, tx?)`                                 | `Skill[]` | the linked targets, without soft-deleted ones |
-| `hasSkill(id, skillId, tx?)`                            | `boolean` | whether the link exists                       |
-| `addSkill(id, skillId, rawInput, tx, context?)`         | —         | adds one link                                 |
-| `addSkillList(id, skillIds, rawInput, tx, context?)`    | —         | adds several links                            |
-| `removeSkill(id, skillId, rawInput, tx, context?)`      | —         | removes one link                              |
-| `removeSkillList(id, skillIds, rawInput, tx, context?)` | —         | removes several links                         |
-| `setSkillList(id, skillIds, rawInput, tx, context?)`    | —         | replaces all links                            |
+| Method                                                  | Returns   | Effect                                                                                                            |
+| ------------------------------------------------------- | --------- | ----------------------------------------------------------------------------------------------------------------- |
+| `getSkillList(id, tx?, options?, context?)`             | `Skill[]` | the linked skills, read through the Skill domain; `NotFoundException` when the employee is missing or not visible |
+| `hasSkill(id, skillId, tx?)`                            | `boolean` | whether the link exists                                                                                           |
+| `addSkill(id, skillId, rawInput, tx, context?)`         | —         | adds one link                                                                                                     |
+| `addSkillList(id, skillIds, rawInput, tx, context?)`    | —         | adds several links                                                                                                |
+| `removeSkill(id, skillId, rawInput, tx, context?)`      | —         | removes one link                                                                                                  |
+| `removeSkillList(id, skillIds, rawInput, tx, context?)` | —         | removes several links                                                                                             |
+| `setSkillList(id, skillIds, rawInput, tx, context?)`    | —         | replaces all links                                                                                                |
 
 The singular name is the relation name without its `List` suffix. `rawInput` is handed to the junction hooks.
 
@@ -753,6 +753,8 @@ const withBooks = await authorDomain.findById(author.id, undefined, { include: [
 | `skipSanitization` | all                    | return hidden and create-only fields too                      |
 | `withSoftDeleted`  | `findById`, `findMany` | include soft-deleted rows                                     |
 
+- **Includes go through the related model's domain.** Its find hooks run with the same `context` — so a hook that scopes
+  reads, by tenant for instance, scopes included rows as well — and its exposure and soft-delete rules apply.
 - **Included relations are not in the static type.** They are added to the returned object under the relation name —
   describe them with your own type, e.g. `Author & { bookList?: Book[] }`.
 - **Filter objects are validated like in the REST API.** An unknown or hidden field, an operator the field's type does
@@ -1015,9 +1017,11 @@ For the relation `skillList` of `Employee`:
 | `DELETE /api/employee/:id/skillList` | `{ "ids": ["…"] }` | 200                        | `remove`  |
 | `DELETE /api/employee/:id/skill`     | `{ "id": "…" }`    | 200                        | `remove`  |
 
-The two `DELETE` endpoints take a JSON body. Linking a pair that is already linked answers **409**, linking a missing
-target **400**. One-to-many, many-to-one and one-to-one relations have no endpoints of their own: write the foreign-key
-field, and read with `include`.
+The list endpoint reads the employee through its own find hooks first — **404** when it is missing, soft-deleted or
+hidden by a hook — and the skills through the Skill domain, so its hooks run with the request context and its exposure
+and soft-delete rules apply. The two `DELETE` endpoints take a JSON body. Linking a pair that is already linked answers
+**409**, linking a missing target **400**. One-to-many, many-to-one and one-to-one relations have no endpoints of their
+own: write the foreign-key field, and read with `include`.
 
 ### Query parameters
 

@@ -1227,7 +1227,7 @@ async function runTests(): Promise<void> {
   assertEquals(childList.length, 1, 'only the live child must be included');
   assertEquals(childList[0].id, childB.id, 'the live child is B');
 
-  // 17.10 many-to-many list excludes soft-deleted target (getJunctionTargets propagation)
+  // 17.10 many-to-many list excludes soft-deleted targets (read through the target domain)
   logStep('17.10 GET /:id/tagList excludes soft-deleted tags');
   const tag1 = await POST('/api/softdeletetag', { label: 'T1' }) as Record<string, unknown>;
   const tag2 = await POST('/api/softdeletetag', { label: 'T2' }) as Record<string, unknown>;
@@ -1512,8 +1512,9 @@ async function runTests(): Promise<void> {
   hookCalls.length = 0;
   await POST(`/api/employee/${junctionEmployee.id}/skill`, { id: junctionSkillId });
   await waitUntil(() => hookCalls.some((call) => call.hook === 'skillList.afterAddJunction'), 'afterAddJunction');
+  const junctionCalls = () => hookCalls.filter((call) => call.hook.startsWith('skillList.'));
   assertEquals(
-    hookCalls.map((call) => call.hook),
+    junctionCalls().map((call) => call.hook),
     [
       'skillList.beforeAddJunction',
       'skillList.preAddJunction',
@@ -1523,7 +1524,7 @@ async function runTests(): Promise<void> {
     'the junction hooks from initializeGenerated must run, in lifecycle order',
   );
   assert(
-    hookCalls.every((call) => typeof call.context?.someString === 'string'),
+    junctionCalls().every((call) => typeof call.context?.someString === 'string'),
     'every junction hook must receive the request context',
   );
 
@@ -1533,7 +1534,7 @@ async function runTests(): Promise<void> {
   assertEquals(removedLink.status, 200, 'removing the link succeeds');
   await waitUntil(() => hookCalls.some((call) => call.hook === 'skillList.afterRemoveJunction'), 'afterRemoveJunction');
   assertEquals(
-    hookCalls.map((call) => call.hook),
+    junctionCalls().map((call) => call.hook),
     [
       'skillList.beforeRemoveJunction',
       'skillList.preRemoveJunction',
@@ -1583,6 +1584,49 @@ async function runTests(): Promise<void> {
   assertEquals(bySql.data.map((row) => row.id), [sqlProbe.id], 'the SQL condition selects exactly the probe row');
   await DELETE(`/api/exposuretestentity/${sqlProbe.id}`);
   logSuccess('✓ The domain refuses filters it cannot apply; SQL conditions reach hidden columns');
+
+  // ========================================
+  // 23. REQUEST CONTEXT IN RELATION INCLUDES
+  // ========================================
+  logSection('23. Testing the Request Context in Relation Includes');
+
+  // The hooks of an included model - tenant scoping, say - must run with the context of the request
+  // that included it. src/main.ts records the department and skill find hooks; John has a department
+  // and two skills.
+  const contextOf = (hook: string): Record<string, unknown> | undefined =>
+    hookCalls.find((call) => call.hook === hook)?.context;
+
+  logStep('23.1 GET by id: the included department and skills receive the request context');
+  hookCalls.length = 0;
+  await GET(`/api/employee/${john.id}?include=department,skillList`);
+  assertEquals(typeof contextOf('department.beforeFindById')?.someString, 'string', 'the department include gets it');
+  assertEquals(typeof contextOf('skill.beforeFindMany')?.someString, 'string', 'the skillList include gets it');
+
+  logStep('23.2 GET list: the batched includes receive it too');
+  hookCalls.length = 0;
+  const johnOnly = encodeURIComponent(encodeFilter({ field: 'id', op: 'eq', value: john.id }));
+  await GET(`/api/employee?where=${johnOnly}&include=department,skillList`);
+  assertEquals(typeof contextOf('department.beforeFindMany')?.someString, 'string', 'the department include gets it');
+  assertEquals(typeof contextOf('skill.beforeFindMany')?.someString, 'string', 'the skillList include gets it');
+  logSuccess('✓ Relation includes hand the request context to the related domains');
+
+  // ========================================
+  // 24. MANY-TO-MANY LIST THROUGH THE PARENT AND TARGET DOMAINS
+  // ========================================
+  logSection('24. Testing the Many-to-Many List Through the Domains');
+
+  // GET /:id/<relation>List used to read the targets with a direct join: neither the parent's nor the
+  // target's hooks ran, and the target's hidden fields were returned.
+  logStep("24.1 The target domain's find hooks run with the request context");
+  hookCalls.length = 0;
+  const johnSkillList = await GET<Skill[]>(`/api/employee/${john.id}/skillList`);
+  assertEquals(johnSkillList.length, 2, 'John still has his two skills');
+  assertEquals(typeof contextOf('skill.beforeFindMany')?.someString, 'string', 'the skill domain gets the context');
+
+  logStep('24.2 The list of an employee that does not exist answers 404');
+  const missingParent = await REQUEST('GET', `/api/employee/${crypto.randomUUID()}/skillList`);
+  assertEquals(missingParent.status, 404, 'a missing parent is a 404, not an empty list');
+  logSuccess('✓ The many-to-many list reads through the parent and target domains');
 
   // ========================================
   // SUCCESS

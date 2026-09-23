@@ -6,7 +6,7 @@ export class JunctionUtilsGenerator {
    * Generate junction utilities file
    */
   generate(): string {
-    return `import { eq, and, sql, isNull } from 'drizzle-orm';
+    return `import { eq, and, sql } from 'drizzle-orm';
 import type { PgTable, TableConfig } from 'drizzle-orm/pg-core';
 import { withoutTransaction, runAfterCommit, type DbTransaction } from '../db/database.ts';
 import type { JunctionTableHooks, DomainHookContext } from './hooks.types.ts';
@@ -234,49 +234,6 @@ export const setJunctions = async <
   if (targetIds.length > 0) {
     await addManyJunctions(config, sourceId, targetIds, rawInput, tx, hooks, context);
   }
-};
-
-/**
- * Get related entities via junction table
- */
-export const getJunctionTargets = async <
-  TJunctionTable extends PgTable<TableConfig>,
-  TTargetTable extends PgTable<TableConfig>,
-  TTarget,
->(
-  config: {
-    junctionTable: TJunctionTable;
-    targetTable: TTargetTable;
-    sourceColumn: keyof TJunctionTable['_']['columns'];
-    targetColumn: keyof TJunctionTable['_']['columns'];
-    /** SQL table name of the target — the key drizzle uses for it in join-result rows */
-    targetTableName: string;
-    /** When true, excludes soft-deleted rows from the target table */
-    targetHasSoftDelete?: boolean;
-  },
-  sourceId: string,
-  tx?: DbTransaction,
-): Promise<TTarget[]> => {
-  const db = tx || withoutTransaction();
-
-  const sourceCol = config.junctionTable[config.sourceColumn as keyof typeof config.junctionTable] as unknown;
-  const targetCol = config.junctionTable[config.targetColumn as keyof typeof config.junctionTable] as unknown;
-  const targetId = config.targetTable['id' as keyof typeof config.targetTable] as unknown;
-
-  const liveCondition = config.targetHasSoftDelete
-    ? and(
-      eq(sourceCol as never, sourceId),
-      isNull(config.targetTable['deletedAt' as keyof typeof config.targetTable] as never),
-    )
-    : eq(sourceCol as never, sourceId);
-
-  const result = await db
-    .select()
-    .from(config.junctionTable as never)
-    .innerJoin(config.targetTable as never, eq(targetCol as never, targetId as never))
-    .where(liveCondition as never);
-
-  return result.map((r) => r[config.targetTableName as keyof typeof r] as TTarget);
 };
 
 /**
