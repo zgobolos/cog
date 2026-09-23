@@ -221,7 +221,7 @@ const CLIENT_ERROR_STATUS_BY_SQLSTATE: Record<string, 400 | 409> = {
   '23001': 409, // restrict_violation - the row is still referenced
   '23505': 409, // unique_violation
   '23502': 400, // not_null_violation
-  '23503': 400, // foreign_key_violation
+  '23503': 400, // foreign_key_violation - the request references a missing row
   '23514': 400, // check_violation
   '22001': 400, // string_data_right_truncation
   '22007': 400, // invalid_datetime_format
@@ -229,13 +229,27 @@ const CLIENT_ERROR_STATUS_BY_SQLSTATE: Record<string, 400 | 409> = {
 };
 
 /**
+ * What a database error means on a delete, where it differs from CLIENT_ERROR_STATUS_BY_SQLSTATE.
+ * A delete writes no references of its own, so a foreign key violation there means the deleted row
+ * is still referenced: PostgreSQL reports NO ACTION this way and CockroachDB even RESTRICT (23001
+ * on PostgreSQL). The message text would tell the two cases apart, but PostgreSQL localizes it.
+ */
+const DELETE_STATUS_BY_SQLSTATE: Record<string, 400 | 409> = {
+  '23503': 409, // foreign_key_violation - the row is still referenced
+};
+
+/**
  * Reads the SQLSTATE of a database error. Drizzle wraps driver errors in a DrizzleQueryError,
  * so the code sits on the cause rather than on the error itself.
  */
-const databaseErrorStatus = (error: unknown): { status: 400 | 409; constraint?: string } | null => {
+const databaseErrorStatus = (
+  error: unknown,
+  operation?: 'delete',
+): { status: 400 | 409; constraint?: string } | null => {
   const driverError = (error as { cause?: unknown }).cause ?? error;
   const { code, constraint_name } = (driverError ?? {}) as { code?: string; constraint_name?: string };
-  const status = code ? CLIENT_ERROR_STATUS_BY_SQLSTATE[code] : undefined;
+  const overrides: Record<string, 400 | 409> = operation === 'delete' ? DELETE_STATUS_BY_SQLSTATE : {};
+  const status = code ? overrides[code] ?? CLIENT_ERROR_STATUS_BY_SQLSTATE[code] : undefined;
 
   return status ? { status, constraint: constraint_name } : null;
 };
@@ -243,8 +257,11 @@ const databaseErrorStatus = (error: unknown): { status: 400 | 409; constraint?: 
 /**
  * Converts domain exceptions to HTTP exceptions
  * Handles centralized error conversion from domain layer
+ *
+ * @param operation - 'delete' when the request deletes a row, which changes what a foreign key
+ *   violation means (see DELETE_STATUS_BY_SQLSTATE)
  */
-export function handleDomainException(error: unknown): never {
+export function handleDomainException(error: unknown, operation?: 'delete'): never {
   if (error instanceof NotFoundException) {
     throw new HTTPException(404, { message: error.message });
   }
@@ -256,7 +273,7 @@ export function handleDomainException(error: unknown): never {
     throw new HTTPException(400, { message: JSON.stringify(error.issues) });
   }
   // Constraint violations are caused by the request, so they are 4xx rather than 500
-  const databaseError = databaseErrorStatus(error);
+  const databaseError = databaseErrorStatus(error, operation);
   if (databaseError) {
     const detail = databaseError.constraint ? \`: \${databaseError.constraint}\` : '';
     throw new HTTPException(databaseError.status, {

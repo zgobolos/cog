@@ -735,6 +735,16 @@ Deno.test('generator - client errors map to HTTP 400 in the REST layer', async (
     assertEquals(factory.includes('c.req.json()'), false);
     assertEquals(factory.includes('await parseJsonBody<TNew>(c)'), true);
     assertEquals(factory.includes('await parseJsonBody<Partial<TNew>>(c)'), true);
+
+    // On a delete a foreign key violation means the row is still referenced - CockroachDB reports
+    // even RESTRICT as 23503 - so the delete handler, and only that one, maps it to 409
+    assertEquals(helpers.includes("'23503': 409"), true);
+    assertEquals(
+      helpers.includes("export function handleDomainException(error: unknown, operation?: 'delete'): never"),
+      true,
+    );
+    assertEquals(factory.split("handleDomainException(error, 'delete')").length - 1, 1);
+    assertEquals(/config\.domain\.delete\([\s\S]*?handleDomainException\(error, 'delete'\)/.test(factory), true);
   } finally {
     await cleanupPostGIS();
   }

@@ -354,9 +354,16 @@ malformed body is a 400 instead of an unhandled 500. Call sites pass the expecte
 | `23001`           | restrict violation    | 409  |
 | `23502`           | not-null violation    | 400  |
 | `23503`           | foreign key violation | 400  |
+| `23503` on delete | row still referenced  | 409  |
 | `23514`           | check violation       | 400  |
 | `22001`           | value too long        | 400  |
 | `22007` / `22P02` | invalid format        | 400  |
+
+`23503` means two things: a write that references a missing row (400) and a delete of a row that is still referenced
+(409). PostgreSQL reports a `NO ACTION` refusal as `23503` and a `RESTRICT` one as `23001`; CockroachDB reports both as
+`23503`. The message text would tell the cases apart, but PostgreSQL localizes it (`lc_messages`), so the rule is keyed
+on the operation: the CRUD factory's delete handler calls `handleDomainException(error, 'delete')`, which applies
+`DELETE_STATUS_BY_SQLSTATE` before the general table. Every other handler keeps the general mapping.
 
 The response message names the violated constraint when the driver reports one. Drizzle wraps driver errors in a
 `DrizzleQueryError`, so the code is read from `error.cause` first, falling back to the error itself. Any other SQLSTATE

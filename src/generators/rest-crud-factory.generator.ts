@@ -238,7 +238,8 @@ export const createDeleteHandler = <T, TNew, RestEnvVars extends Record<string, 
 
       return c.json({ data: convertBigIntToNumber(result) });
     } catch (error) {
-      handleDomainException(error);
+      // A foreign key violation here means the row is still referenced: 409, not 400
+      handleDomainException(error, 'delete');
     }
   };
 };

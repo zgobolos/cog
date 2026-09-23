@@ -523,7 +523,9 @@ many-to-many relationships are always created in the default schema, even when t
 
 These are emitted onto the generated Drizzle column, so drizzle-kit creates the foreign key with them. A many-to-many
 relationship can declare `onDelete`/`onUpdate` too; its junction foreign keys cascade by default, because a junction row
-is meaningless once either side is gone. A delete refused by `RESTRICT` answers **409**.
+is meaningless once either side is gone. A delete refused because the row is still referenced (`RESTRICT` or
+`NO ACTION`) answers **409** on both PostgreSQL and CockroachDB; a create or update that references a missing row
+answers **400**.
 
 ### Field Exposure Control
 

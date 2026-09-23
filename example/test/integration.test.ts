@@ -1343,7 +1343,37 @@ async function runTests(): Promise<void> {
   await DELETE(`/api/employee/${restrictEmployee.id}`);
   const allowed = await REQUEST('DELETE', `/api/department/${fkDept.id}`);
   assertEquals(allowed.status, 200, 'the department is deletable once no employee references it');
-  logSuccess('✓ Referential actions: CASCADE removes the child, RESTRICT blocks the parent delete');
+
+  // AdvancedDemo.relatedId declares onDelete NO ACTION. Both databases report that refusal as 23503
+  // (foreign_key_violation) - CockroachDB even reports RESTRICT that way - and on a delete it means
+  // the row is still referenced: a conflict, not a malformed request.
+  logStep('19.3 A row still referenced through NO ACTION cannot be deleted (409)');
+  const noActionTarget = await POST('/api/advanceddemo', {
+    name: 'NO ACTION Target',
+    optionalField1: 'first',
+    optionalField2: 1,
+  }) as Record<string, unknown>;
+  const noActionSource = await POST('/api/advanceddemo', {
+    name: 'NO ACTION Source',
+    optionalField1: 'first',
+    optionalField2: 1,
+    relatedId: noActionTarget.id,
+  }) as Record<string, unknown>;
+  const stillReferenced = await REQUEST('DELETE', `/api/advanceddemo/${noActionTarget.id}`);
+  assertEquals(stillReferenced.status, 409, 'deleting a still referenced row must answer HTTP 409');
+
+  logStep('19.4 A reference to a missing row stays a client error (400)');
+  const dangling = await REQUEST('POST', '/api/advanceddemo', {
+    name: 'Dangling Reference',
+    optionalField1: 'first',
+    optionalField2: 1,
+    relatedId: crypto.randomUUID(),
+  });
+  assertEquals(dangling.status, 400, 'a create referencing a missing row must answer HTTP 400');
+
+  await DELETE(`/api/advanceddemo/${noActionSource.id}`);
+  await DELETE(`/api/advanceddemo/${noActionTarget.id}`);
+  logSuccess('✓ Referential actions: CASCADE removes the child; RESTRICT and NO ACTION block the parent delete');
 
   // ========================================
   // 20. AFTER HOOKS START ONCE THE TRANSACTION HAS COMMITTED
