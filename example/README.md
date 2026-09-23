@@ -424,7 +424,7 @@ curl -X POST http://localhost:3000/api/advanceddemo \
 ### Query with Pagination
 
 ```bash
-curl "http://localhost:3000/api/employee?limit=20&offset=0&orderBy=lastName&order=asc"
+curl "http://localhost:3000/api/employee?limit=20&offset=0&orderBy=lastName&orderDirection=asc"
 ```
 
 ---
@@ -539,13 +539,13 @@ This example works with both PostgreSQL and CockroachDB:
 **PostgreSQL:**
 
 - Full PostGIS support (GEOGRAPHY + GEOMETRY)
-- All index types (BTREE, GIN, GIST)
+- Index types BTREE, GIN and GIST (no HASH, SPGIST or BRIN)
 - Enums supported (all versions)
 
 **CockroachDB:**
 
-- PostGIS GEOMETRY support (GEOGRAPHY auto-converts)
-- All index types (BTREE, GIN, GIST)
+- GEOMETRY and GEOGRAPHY built in, no PostGIS extension needed
+- Index types BTREE, GIN and GIST (no HASH, SPGIST or BRIN)
 - Enums supported (v22.2+)
 
 Generate with appropriate flag:
