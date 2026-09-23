@@ -85,7 +85,7 @@ generated/
 ├── index.ts                    # initializeGenerated() entry point
 ├── drizzle.config.ts           # drizzle-kit config (schema path, filters, credentials)
 ├── db/
-│   ├── database.ts             # Connection pooling, transactions
+│   ├── database.ts             # Connection pooling, transactions, after-commit queue
 │   └── bootstrap.ts            # PostGIS extension (PostgreSQL only)
 ├── schema/
 │   ├── [model].schema.ts       # Drizzle tables + Zod schemas
@@ -295,6 +295,29 @@ Before-hook (outside tx) → Zod validation → Begin TX → Pre-hook → Zod �
 Same pattern for `Update`, `Delete`, `FindById`, `FindMany`, and junction operations (`AddJunction`, `RemoveJunction`).
 
 **Context**: `{ requestId, userId, metadata }` - set via Hono middleware
+
+**After-hooks are bound to the transaction's outcome.** A domain method does not start its after-hook, it hands it to
+`runAfterCommit(tx, task)` (generated `db/database.ts`), which queues it on the transaction it runs in:
+
+- The queue is a `WeakMap` keyed by the transaction object, so it travels wherever `tx` is passed and no signature
+  changed. Neither drizzle nor postgres-js has an on-commit callback; the promise of `database.transaction()` is the
+  signal, since postgres-js resolves it only after `COMMIT` succeeded (a failing `COMMIT` rejects it).
+- `withTransaction` creates a fresh queue per attempt and starts it after that promise resolved, in scheduling order,
+  not awaited (`setTimeout(0)` per task, failures go to the configured logger). A rollback, a failing `COMMIT` and a
+  failed attempt before a 40001 retry all drop the queue.
+- `withNestedTransaction(parent, cb)` opens a savepoint with its own queue. A savepoint is not a commit: on success its
+  queue is appended to the parent's, on failure it is dropped. A drizzle `tx.transaction()` returns a new tx object with
+  no reference to its parent, which is why nesting has to go through COG.
+- A transaction COG did not open (plain `db.transaction()` / `tx.transaction()`) has no queue: `runAfterCommit` throws
+  rather than lose the hook silently. Without a transaction (reads) the hook starts right away.
+- After-hooks receive the same result the caller gets (sanitized unless `skipSanitization`), so they are scheduled after
+  the sanitization step.
+- Delivery is at most once: a process that stops right after `COMMIT`, or a connection that breaks during it (an
+  ambiguous commit, `40003` on CockroachDB), never runs the hook. A side effect that must not be missed needs an outbox
+  row written in the same transaction.
+
+The previous `setTimeout(0)` inside the transaction callback fired before the `COMMIT` round trip finished (other
+connections still saw the old state), ran after a rollback, and ran once per retry attempt.
 
 ## Exceptions
 

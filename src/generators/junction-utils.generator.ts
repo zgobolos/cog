@@ -8,7 +8,7 @@ export class JunctionUtilsGenerator {
   generate(): string {
     return `import { eq, and, sql, isNull } from 'drizzle-orm';
 import type { PgTable, TableConfig } from 'drizzle-orm/pg-core';
-import { withoutTransaction, type DbTransaction } from '../db/database.ts';
+import { withoutTransaction, runAfterCommit, type DbTransaction } from '../db/database.ts';
 import type { JunctionTableHooks, DomainHookContext } from './hooks.types.ts';
 
 /**
@@ -82,11 +82,10 @@ export const addJunctionWithHooks = async <
     await hooks.postAddJunction(ids, rawInput, tx, context);
   }
 
-  // After-add hook (outside transaction, async)
+  // After-add hook: starts once the transaction has committed
   if (hooks.afterAddJunction) {
-    setTimeout(() => {
-      hooks.afterAddJunction!(ids, rawInput, context).catch(console.error);
-    }, 0);
+    const afterAddJunction = hooks.afterAddJunction;
+    runAfterCommit(tx, () => afterAddJunction(ids, rawInput, context));
   }
 };
 
@@ -143,11 +142,10 @@ export const removeJunctionWithHooks = async <
     await hooks.postRemoveJunction(ids, rawInput, tx, context);
   }
 
-  // After-remove hook (outside transaction, async)
+  // After-remove hook: starts once the transaction has committed
   if (hooks.afterRemoveJunction) {
-    setTimeout(() => {
-      hooks.afterRemoveJunction!(ids, rawInput, context).catch(console.error);
-    }, 0);
+    const afterRemoveJunction = hooks.afterRemoveJunction;
+    runAfterCommit(tx, () => afterRemoveJunction(ids, rawInput, context));
   }
 };
 

@@ -23,6 +23,10 @@ import {
   type IDCard,
   type Project,
   type Skill,
+  SkillDomain,
+  withNestedTransaction,
+  withoutTransaction,
+  withTransaction,
 } from '../generated/index.ts';
 import { type ServerHandle, startServer } from '../src/main.ts';
 
@@ -162,6 +166,21 @@ function logSuccess(message: string): void {
 function logData(label: string, data: unknown): void {
   console.log(`  ${label}:`, JSON.stringify(data, null, 2).split('\n').slice(0, 10).join('\n  '));
 }
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Wait for work that is not awaited by its caller (after* hooks) to reach a state
+ */
+const waitUntil = async (condition: () => boolean, description: string, timeoutMs = 5000): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) {
+      throw new Error(`Timed out waiting for: ${description}`);
+    }
+    await sleep(20);
+  }
+};
 
 // ============================================================================
 // Test Types
@@ -1325,6 +1344,119 @@ async function runTests(): Promise<void> {
   const allowed = await REQUEST('DELETE', `/api/department/${fkDept.id}`);
   assertEquals(allowed.status, 200, 'the department is deletable once no employee references it');
   logSuccess('✓ Referential actions: CASCADE removes the child, RESTRICT blocks the parent delete');
+
+  // ========================================
+  // 20. AFTER HOOKS START ONCE THE TRANSACTION HAS COMMITTED
+  // ========================================
+  logSection('20. Testing after* Hooks Against the Transaction Outcome');
+
+  // The hook records when it starts and whether a connection of its own can already read the row:
+  // that is what a sync started from an after* hook sees.
+  const hookStarts: string[] = [];
+  const hookSawRow = new Map<string, boolean>();
+  const probeDomain = new SkillDomain({
+    afterCreate: async (skill: Skill): Promise<void> => {
+      hookStarts.push(skill.name);
+      const rows = await getSQL()`SELECT id FROM skill WHERE id = ${skill.id}`;
+      hookSawRow.set(skill.name, rows.length === 1);
+    },
+  });
+  const probeName = (label: string): string => `after-commit-${crypto.randomUUID().slice(0, 8)}-${label}`;
+  const startsOf = (name: string): number => hookStarts.filter((started) => started === name).length;
+
+  logStep('20.1 afterCreate sees the committed row from another connection');
+  const committedName = probeName('committed');
+  const committed = await withTransaction(async (tx) => {
+    const skill = await probeDomain.create({ name: committedName }, tx);
+    // Keep the transaction open: a hook started before COMMIT would find nothing
+    await sleep(200);
+    return skill;
+  });
+  await waitUntil(() => hookSawRow.has(committedName), 'afterCreate of the committed row');
+  assertEquals(hookSawRow.get(committedName), true, 'afterCreate must start after COMMIT');
+
+  logStep('20.2 A rolled-back transaction drops its after* hooks');
+  const rolledBackName = probeName('rolled-back');
+  const rollbackError = await withTransaction(async (tx) => {
+    await probeDomain.create({ name: rolledBackName }, tx);
+    throw new Error('rollback probe');
+  }).catch((error: unknown) => error);
+  assert(rollbackError instanceof Error && rollbackError.message === 'rollback probe', 'the rollback error surfaces');
+  await sleep(300);
+  assertEquals(startsOf(rolledBackName), 0, 'a rolled-back create must not run afterCreate');
+
+  logStep('20.3 A retried attempt drops the hooks of the failed one');
+  const retriedName = probeName('retried');
+  let attempts = 0;
+  const retried = await withTransaction(async (tx) => {
+    const skill = await probeDomain.create({ name: retriedName }, tx);
+    attempts++;
+    if (attempts === 1) {
+      // What PostgreSQL and CockroachDB raise on a serialization conflict
+      throw Object.assign(new Error('serialization probe'), { code: '40001' });
+    }
+    return skill;
+  });
+  await waitUntil(() => hookSawRow.has(retriedName), 'afterCreate of the retried create');
+  await sleep(100);
+  assertEquals(attempts, 2, 'the serialization failure is retried');
+  assertEquals(startsOf(retriedName), 1, 'afterCreate runs once, for the attempt that committed');
+
+  logStep('20.4 A savepoint hands its hooks to the parent, a failed savepoint drops them');
+  const parentName = probeName('parent');
+  const nestedName = probeName('nested');
+  const failedNestedName = probeName('nested-failed');
+  const nestedIds = await withTransaction(async (tx) => {
+    const parent = await probeDomain.create({ name: parentName }, tx);
+    const nested = await withNestedTransaction(tx, (savepoint) => probeDomain.create({ name: nestedName }, savepoint));
+    await withNestedTransaction(tx, async (savepoint) => {
+      await probeDomain.create({ name: failedNestedName }, savepoint);
+      throw new Error('savepoint probe');
+    }).catch(() => undefined);
+    // Neither hook may start while the outer transaction is still open
+    await sleep(200);
+    return [parent.id, nested.id];
+  });
+  await waitUntil(
+    () => hookSawRow.has(parentName) && hookSawRow.has(nestedName),
+    'afterCreate of the parent and the nested create',
+  );
+  await sleep(100);
+  assertEquals(
+    hookStarts.filter((name) => [parentName, nestedName, failedNestedName].includes(name)),
+    [parentName, nestedName],
+    'hooks start in scheduling order, without the rolled-back savepoint',
+  );
+  assertEquals(hookSawRow.get(parentName), true, 'the parent row is committed when its hook starts');
+  assertEquals(hookSawRow.get(nestedName), true, 'the nested row is committed with the outer transaction');
+
+  logStep('20.5 An after* hook on a transaction COG did not open fails loudly');
+  const foreignName = probeName('foreign');
+  const foreignError = await withoutTransaction()
+    .transaction((tx) => probeDomain.create({ name: foreignName }, tx))
+    .catch((error: unknown) => error);
+  assert(
+    foreignError instanceof Error && foreignError.message.includes('withTransaction()'),
+    'scheduling on a foreign transaction must throw',
+  );
+  const foreignRows = await getSQL()`SELECT id FROM skill WHERE name = ${foreignName}`;
+  assertEquals(foreignRows.length, 0, 'the refused create is rolled back with its transaction');
+
+  logStep('20.6 A read without a transaction starts its after* hook right away');
+  const readHookIds: string[] = [];
+  const readDomain = new SkillDomain({
+    afterFindById: (skill: Skill | null): Promise<void> => {
+      if (skill) readHookIds.push(skill.id);
+      return Promise.resolve();
+    },
+  });
+  await readDomain.findById(committed.id);
+  await waitUntil(() => readHookIds.includes(committed.id), 'afterFindById of a read without a transaction');
+
+  for (const id of [committed.id, retried.id, ...nestedIds]) {
+    await DELETE(`/api/skill/${id}`);
+  }
+  logSuccess('✓ after* hooks start after COMMIT; rollback, retry and a failed savepoint drop them');
 
   // ========================================
   // SUCCESS

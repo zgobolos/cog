@@ -1028,3 +1028,71 @@ Deno.test('generator - foreign keys carry their referential actions', async () =
     await cleanupForeignKeys();
   }
 });
+
+const AFTER_COMMIT_MODELS = './test/test-after-commit-models';
+const AFTER_COMMIT_OUTPUT = './test/test-after-commit-generated';
+
+async function cleanupAfterCommit() {
+  for (const p of [AFTER_COMMIT_MODELS, AFTER_COMMIT_OUTPUT]) {
+    try {
+      await Deno.remove(p, { recursive: true });
+    } catch {
+      // Ignore if doesn't exist
+    }
+  }
+}
+
+Deno.test('generator - after* hooks start once their transaction has committed', async () => {
+  await cleanupAfterCommit();
+  try {
+    await Deno.mkdir(AFTER_COMMIT_MODELS, { recursive: true });
+    const idField = { name: 'id', type: 'uuid', primaryKey: true, defaultValue: 'gen_random_uuid()', required: true };
+    // A many-to-many relation, so the junction utilities are generated as well
+    const tag = {
+      name: 'Tag',
+      tableName: 'tag',
+      fields: [idField],
+      relationships: [{ type: 'manyToMany', name: 'noteList', target: 'Note', through: 'note_tag' }],
+    };
+    const note = { name: 'Note', tableName: 'note', fields: [idField] };
+    await Deno.writeTextFile(`${AFTER_COMMIT_MODELS}/tag.json`, JSON.stringify(tag, null, 2));
+    await Deno.writeTextFile(`${AFTER_COMMIT_MODELS}/note.json`, JSON.stringify(note, null, 2));
+    await generateFromModels(AFTER_COMMIT_MODELS, AFTER_COMMIT_OUTPUT);
+
+    const read = (path: string): Promise<string> => Deno.readTextFile(`${AFTER_COMMIT_OUTPUT}/${path}`);
+    const database = await read('db/database.ts');
+    const domain = await read('domain/tag.domain.ts');
+    const baseDomain = await read('domain/base.domain.ts');
+    const junction = await read('domain/junction.utils.ts');
+
+    // setTimeout inside the transaction callback fired before COMMIT, and even after a rollback
+    for (const file of [domain, baseDomain, junction]) {
+      assertEquals(file.includes('setTimeout'), false);
+    }
+    for (const hook of ['afterCreate', 'afterUpdate', 'afterDelete', 'afterFindById', 'afterFindMany']) {
+      assertEquals(domain.includes(`runAfterCommit(tx, () => ${hook}(`), true, `domain: ${hook}`);
+      assertEquals(baseDomain.includes(`runAfterCommit(tx, () => ${hook}(`), true, `base domain: ${hook}`);
+    }
+    for (const hook of ['afterAddJunction', 'afterRemoveJunction']) {
+      assertEquals(junction.includes(`runAfterCommit(tx, () => ${hook}(`), true, `junction: ${hook}`);
+    }
+
+    // Every attempt gets a fresh queue, started only after database.transaction() resolved,
+    // which postgres-js does once COMMIT has succeeded
+    const queueCreated = database.indexOf('const afterCommit: AfterCommitTask[] = [];');
+    const transactionAwaited = database.indexOf('await database.transaction(');
+    const queueStarted = database.indexOf('afterCommit.forEach(startDetached);');
+    const retryLoop = database.indexOf('for (let attempt = 0;');
+    assertEquals(
+      retryLoop < queueCreated && queueCreated < transactionAwaited && transactionAwaited < queueStarted,
+      true,
+    );
+
+    // A savepoint is not a commit: the nested queue is handed to the parent
+    assertEquals(database.includes('export const withNestedTransaction = async <T>('), true);
+    assertEquals(database.includes('parentQueue.push(...afterCommit);'), true);
+    assertEquals(database.includes('export const runAfterCommit = '), true);
+  } finally {
+    await cleanupAfterCommit();
+  }
+});

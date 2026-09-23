@@ -129,7 +129,10 @@ export interface DomainHooks<T, CreateInput, UpdateInput, DomainEnvVars extends 
   postFindById?: (id: string, result: T | null, tx?: DbTransaction, context?: DomainHookContext<DomainEnvVars>) => Promise<T | null>;
   postFindMany?: (options: QueryOptions, results: T[], tx?: DbTransaction, context?: DomainHookContext<DomainEnvVars>) => Promise<T[]>;
 
-  // After-operation hooks (outside transaction, async)
+  // After-operation hooks (outside transaction, not awaited)
+  // Note: Start once the transaction has committed - the outermost one, for a nested transaction
+  // Note: A rollback drops them; a read without a transaction starts them right away
+  // Note: Receive the same result the caller gets (sanitized unless skipSanitization is set)
   afterCreate?: (result: T, rawInput: unknown, context?: DomainHookContext<DomainEnvVars>) => Promise<void>;
   afterUpdate?: (result: T, rawInput: unknown, context?: DomainHookContext<DomainEnvVars>) => Promise<void>;
   afterDelete?: (result: T, context?: DomainHookContext<DomainEnvVars>) => Promise<void>;
@@ -169,7 +172,9 @@ export interface JunctionTableHooks<DomainEnvVars extends Record<string, unknown
   postAddJunction?: (ids: Record<string, string>, rawInput: unknown, tx: DbTransaction, context?: DomainHookContext<DomainEnvVars>) => Promise<void>;
   postRemoveJunction?: (ids: Record<string, string>, rawInput: unknown, tx: DbTransaction, context?: DomainHookContext<DomainEnvVars>) => Promise<void>;
 
-  // After-operation hooks (outside transaction, async)
+  // After-operation hooks (outside transaction, not awaited)
+  // Note: Start once the transaction has committed - the outermost one, for a nested transaction
+  // Note: A rollback drops them
   afterAddJunction?: (ids: Record<string, string>, rawInput: unknown, context?: DomainHookContext<DomainEnvVars>) => Promise<void>;
   afterRemoveJunction?: (ids: Record<string, string>, rawInput: unknown, context?: DomainHookContext<DomainEnvVars>) => Promise<void>;
 }
@@ -211,7 +216,7 @@ export interface JunctionTableHooks<DomainEnvVars extends Record<string, unknown
 
     return `${drizzleImports}
 import { NotFoundException } from './exceptions.ts';
-import { withoutTransaction, type DbTransaction } from '../db/database.ts';
+import { withoutTransaction, runAfterCommit, type DbTransaction } from '../db/database.ts';
 import { ${modelNameLower}Table, type ${modelName}, type New${modelName}, ${modelNameLower}InsertSchema, ${modelNameLower}UpdateSchema, ${modelNameLower}FieldMeta } from '../schema/${modelNameLower}.schema.ts';
 ${this.generateRelationImports(model)}
 ${this.generateJunctionTableImports(model)}
@@ -278,18 +283,16 @@ export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = 
       result = await this.hooks.postCreate(processedInput, created, input, tx, context);
     }
 
-    // After-create hook (outside transaction, after post-hook)
-    if (this.hooks.afterCreate) {
-      // Schedule asynchronously to not block the response
-      setTimeout(() => {
-        this.hooks.afterCreate!(result, input, context).catch(console.error);
-      }, 0);
-    }
-
     // Sanitize response (strip unexposed fields) unless skipped
     // For create, use CreateUnexposedFields (strips hidden only, keeps create-only visible)
     if (!options?.skipSanitization) {
       result = stripUnexposedFields(result, ${modelNameLower}CreateUnexposedFields) as ${modelName};
+    }
+
+    // After-create hook: starts once the transaction has committed, receives what the caller gets
+    if (this.hooks.afterCreate) {
+      const afterCreate = this.hooks.afterCreate;
+      runAfterCommit(tx, () => afterCreate(result, input, context));
     }
 
     return result;
@@ -335,16 +338,15 @@ export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = 
       finalResult = await this.hooks.postFindById(id, found, tx, context);
     }
 
-    // After-find hook (outside transaction, after post-hook)
-    if (this.hooks.afterFindById) {
-      setTimeout(() => {
-        this.hooks.afterFindById!(finalResult, context).catch(console.error);
-      }, 0);
-    }
-
     // Sanitize response (strip unexposed fields) unless skipped
     if (finalResult && !options?.skipSanitization) {
       finalResult = stripUnexposedFields(finalResult, ${modelNameLower}ReadUnexposedFields) as ${modelName};
+    }
+
+    // After-find hook: starts once the transaction has committed, right away without one
+    if (this.hooks.afterFindById) {
+      const afterFindById = this.hooks.afterFindById;
+      runAfterCommit(tx, () => afterFindById(finalResult, context));
     }
 
     return finalResult;
@@ -436,16 +438,15 @@ export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = 
       ? await this.hooks.postFindMany(options, results, tx, context)
       : results;
 
-    // After-find hook (outside transaction, after post-hook)
-    if (this.hooks.afterFindMany) {
-      setTimeout(() => {
-        this.hooks.afterFindMany!(finalResults, context).catch(console.error);
-      }, 0);
-    }
-
     // Sanitize response (strip unexposed fields) unless skipped
     if (!options.skipSanitization) {
       finalResults = stripUnexposedFields(finalResults, ${modelNameLower}ReadUnexposedFields) as ${modelName}[];
+    }
+
+    // After-find hook: starts once the transaction has committed, right away without one
+    if (this.hooks.afterFindMany) {
+      const afterFindMany = this.hooks.afterFindMany;
+      runAfterCommit(tx, () => afterFindMany(finalResults, context));
     }
 
     return {
@@ -505,16 +506,15 @@ export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = 
       result = await this.hooks.postUpdate(id, processedInput, updated, input, tx, context);
     }
 
-    // After-update hook (outside transaction, after post-hook)
-    if (this.hooks.afterUpdate) {
-      setTimeout(() => {
-        this.hooks.afterUpdate!(result, input, context).catch(console.error);
-      }, 0);
-    }
-
     // Sanitize response (strip unexposed fields) unless skipped
     if (!options?.skipSanitization) {
       result = stripUnexposedFields(result, ${modelNameLower}ReadUnexposedFields) as ${modelName};
+    }
+
+    // After-update hook: starts once the transaction has committed, receives what the caller gets
+    if (this.hooks.afterUpdate) {
+      const afterUpdate = this.hooks.afterUpdate;
+      runAfterCommit(tx, () => afterUpdate(result, input, context));
     }
 
     return result;
@@ -548,16 +548,15 @@ export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = 
       result = await this.hooks.postDelete(id, deleted, tx, context);
     }
 
-    // After-delete hook (outside transaction, after post-hook)
-    if (this.hooks.afterDelete) {
-      setTimeout(() => {
-        this.hooks.afterDelete!(result, context).catch(console.error);
-      }, 0);
-    }
-
     // Sanitize response (strip unexposed fields) unless skipped
     if (!options?.skipSanitization) {
       result = stripUnexposedFields(result, ${modelNameLower}ReadUnexposedFields) as ${modelName};
+    }
+
+    // After-delete hook: starts once the transaction has committed, receives what the caller gets
+    if (this.hooks.afterDelete) {
+      const afterDelete = this.hooks.afterDelete;
+      runAfterCommit(tx, () => afterDelete(result, context));
     }
 
     return result;

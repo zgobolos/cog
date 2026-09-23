@@ -22,7 +22,7 @@ import { eq, desc, asc, sql, type AnyColumn } from 'drizzle-orm';
 import { type PgTable } from 'drizzle-orm/pg-core';
 import { type ZodSchema } from 'zod';
 import { NotFoundException } from './exceptions.ts';
-import { withoutTransaction, type DbTransaction } from '../db/database.ts';
+import { withoutTransaction, runAfterCommit, type DbTransaction } from '../db/database.ts';
 import { DomainHooks, DomainHookContext, QueryOptions } from './hooks.types.ts';
 import { buildWhereSQL, isWhereFilter, stripUnexposedFields, stripUnacceptedFields, type SQL, type FieldMeta } from '../utils/filter.utils.ts';
 import { getExposedFields, getCreateUnexposedFields, getReadUnexposedFields, getCreateUnacceptedFields, getUpdateUnacceptedFields } from '../utils/field-meta.utils.ts';
@@ -182,16 +182,15 @@ export abstract class BaseDomain<
       result = await this.hooks.postCreate(processedInput, created, input, tx, context);
     }
 
-    // After-create hook (outside transaction, async)
-    if (this.hooks.afterCreate) {
-      setTimeout(() => {
-        this.hooks.afterCreate!(result, input, context).catch(console.error);
-      }, 0);
-    }
-
     // Sanitize response (strip unexposed fields) unless skipped
     if (!options?.skipSanitization) {
       result = stripUnexposedFields(result, this.fields.createUnexposedFields) as T;
+    }
+
+    // After-create hook: starts once the transaction has committed, receives what the caller gets
+    if (this.hooks.afterCreate) {
+      const afterCreate = this.hooks.afterCreate;
+      runAfterCommit(tx, () => afterCreate(result, input, context));
     }
 
     return result;
@@ -238,16 +237,15 @@ export abstract class BaseDomain<
       finalResult = await this.hooks.postFindById(id, found, tx, context);
     }
 
-    // After-find hook (outside transaction, async)
-    if (this.hooks.afterFindById) {
-      setTimeout(() => {
-        this.hooks.afterFindById!(finalResult, context).catch(console.error);
-      }, 0);
-    }
-
     // Sanitize response unless skipped
     if (finalResult && !options?.skipSanitization) {
       finalResult = stripUnexposedFields(finalResult, this.fields.readUnexposedFields) as T;
+    }
+
+    // After-find hook: starts once the transaction has committed, right away without one
+    if (this.hooks.afterFindById) {
+      const afterFindById = this.hooks.afterFindById;
+      runAfterCommit(tx, () => afterFindById(finalResult, context));
     }
 
     return finalResult;
@@ -330,16 +328,15 @@ export abstract class BaseDomain<
       ? await this.hooks.postFindMany(options, results, tx, context)
       : results;
 
-    // After-find hook (outside transaction, async)
-    if (this.hooks.afterFindMany) {
-      setTimeout(() => {
-        this.hooks.afterFindMany!(finalResults, context).catch(console.error);
-      }, 0);
-    }
-
     // Sanitize response unless skipped
     if (!options.skipSanitization) {
       finalResults = stripUnexposedFields(finalResults, this.fields.readUnexposedFields) as T[];
+    }
+
+    // After-find hook: starts once the transaction has committed, right away without one
+    if (this.hooks.afterFindMany) {
+      const afterFindMany = this.hooks.afterFindMany;
+      runAfterCommit(tx, () => afterFindMany(finalResults, context));
     }
 
     return {
@@ -404,16 +401,15 @@ export abstract class BaseDomain<
       result = await this.hooks.postUpdate(id, processedInput, updated, input, tx, context);
     }
 
-    // After-update hook (outside transaction, async)
-    if (this.hooks.afterUpdate) {
-      setTimeout(() => {
-        this.hooks.afterUpdate!(result, input, context).catch(console.error);
-      }, 0);
-    }
-
     // Sanitize response unless skipped
     if (!options?.skipSanitization) {
       result = stripUnexposedFields(result, this.fields.readUnexposedFields) as T;
+    }
+
+    // After-update hook: starts once the transaction has committed, receives what the caller gets
+    if (this.hooks.afterUpdate) {
+      const afterUpdate = this.hooks.afterUpdate;
+      runAfterCommit(tx, () => afterUpdate(result, input, context));
     }
 
     return result;
@@ -455,16 +451,15 @@ export abstract class BaseDomain<
       result = await this.hooks.postDelete(id, deleted, tx, context);
     }
 
-    // After-delete hook (outside transaction, async)
-    if (this.hooks.afterDelete) {
-      setTimeout(() => {
-        this.hooks.afterDelete!(result, context).catch(console.error);
-      }, 0);
-    }
-
     // Sanitize response unless skipped
     if (!options?.skipSanitization) {
       result = stripUnexposedFields(result, this.fields.readUnexposedFields) as T;
+    }
+
+    // After-delete hook: starts once the transaction has committed, receives what the caller gets
+    if (this.hooks.afterDelete) {
+      const afterDelete = this.hooks.afterDelete;
+      runAfterCommit(tx, () => afterDelete(result, context));
     }
 
     return result;

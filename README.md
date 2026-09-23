@@ -164,7 +164,7 @@ DELETE /api/department/:id   # Delete department
 generated/
 +-- index.ts                    # initializeGenerated() entry point
 +-- db/
-|   +-- database.ts             # Connection pooling, transactions
+|   +-- database.ts             # Connection pooling, transactions, after-commit queue
 |   +-- bootstrap.ts            # PostGIS extension (PostgreSQL only)
 +-- schema/
 |   +-- [model].schema.ts       # Drizzle tables + Zod schemas
@@ -251,6 +251,38 @@ relationships.
 (transaction), `context` (shared state). See [AGENTS.md](./AGENTS.md#hook-system) for complete signatures.
 
 **HTTP-layer concerns (auth, headers, logging):** Use Hono middleware instead.
+
+#### After-hooks and transactions
+
+An after-hook starts only once the transaction it ran in has committed. The domain method queues it on the transaction;
+`withTransaction` starts the queue after a successful `COMMIT`, in scheduling order and without awaiting it. A rollback
+drops the queue, and so does a failed attempt before a serialization retry (40001): every attempt is a transaction of
+its own. A read without a transaction starts its after-hook right away.
+
+```typescript
+import { withNestedTransaction, withTransaction } from './generated/index.ts';
+
+await withTransaction(async (tx) => {
+  await orderDomain.create(order, tx); // afterCreate is queued, not started
+  try {
+    await withNestedTransaction(tx, async (nested) => {
+      await auditDomain.create(entry, nested); // queued in the savepoint
+    });
+  } catch {
+    // the savepoint rolled back: the audit entry and its afterCreate are gone, the order stays
+  }
+}); // COMMIT, then the order's afterCreate starts
+```
+
+- **Open transactions through COG.** Use `withTransaction`, and `withNestedTransaction` for a savepoint. A savepoint is
+  not a commit, so its after-hooks move to the parent and start with the outermost `COMMIT`. A domain method that
+  receives a transaction COG did not open (a plain `db.transaction()` or `tx.transaction()`) throws instead of dropping
+  its after-hook silently.
+- **Your own post-commit work:** `runAfterCommit(tx, task)` is exported, e.g. for a `post*` hook that has to notify
+  another system once the data is committed.
+- **What they receive:** the same result the caller gets, sanitized unless `skipSanitization` is set.
+- **At most once:** if the process stops right after `COMMIT`, or the connection breaks during it, the after-hook does
+  not run. For a side effect that must never be missed, write an outbox row in the same transaction instead.
 
 ### Database Compatibility
 

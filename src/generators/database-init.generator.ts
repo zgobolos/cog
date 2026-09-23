@@ -171,10 +171,62 @@ export function withoutTransaction() {
 }
 
 /**
+ * Work an after* hook schedules, started once its transaction has committed
+ */
+export type AfterCommitTask = () => Promise<void>;
+
+// The after-commit queue of every transaction COG opened. Keyed by the transaction object, so the
+// queue travels wherever the transaction is passed and is released together with it.
+const afterCommitQueues = new WeakMap<DbTransaction, AfterCommitTask[]>();
+
+const UNKNOWN_TRANSACTION_MESSAGE =
+  'The transaction was not opened by withTransaction() or withNestedTransaction(). ' +
+  'after* hooks start once their transaction has committed, so COG has to open that transaction.';
+
+/**
+ * Start a task without awaiting it. It starts on a later tick, so the caller's own continuation
+ * (building the HTTP response) is not held up; a failure is logged, never thrown.
+ */
+const startDetached = (task: AfterCommitTask): void => {
+  setTimeout(async () => {
+    try {
+      await task();
+    } catch (error: unknown) {
+      logger.error?.('[afterCommit] After-commit task failed:', error);
+    }
+  }, 0);
+};
+
+/**
+ * Schedule an after* hook.
+ *
+ * Inside a transaction the task starts once that transaction has committed (the outermost one,
+ * for a nested transaction) and is dropped when it rolls back. Without a transaction there is
+ * nothing to wait for, so it starts right away. It is never awaited.
+ *
+ * @throws when tx was not opened by withTransaction() or withNestedTransaction()
+ */
+export const runAfterCommit = (tx: DbTransaction | undefined, task: AfterCommitTask): void => {
+  if (!tx) {
+    startDetached(task);
+    return;
+  }
+  const queue = afterCommitQueues.get(tx);
+  if (!queue) {
+    throw new Error(UNKNOWN_TRANSACTION_MESSAGE);
+  }
+  queue.push(task);
+};
+
+/**
  * Execute database operations within a transaction context
  *
  * Automatically retries transactions on serialization errors (error code 40001)
  * which commonly occur in CockroachDB and PostgreSQL under high concurrency.
+ *
+ * after* hooks scheduled inside the callback start once the transaction has committed, in the
+ * order they were scheduled, and are not awaited. A rollback drops them, and so does a failed
+ * attempt before a retry: every attempt is a transaction of its own.
  *
  * @param callback - Function to execute within the transaction
  * @param options - Transaction and retry configuration options
@@ -232,10 +284,18 @@ export async function withTransaction<T>(
       if (options?.accessMode) txOptions.accessMode = options.accessMode;
       if (options?.deferrable !== undefined) txOptions.deferrable = options.deferrable;
 
-      return await database.transaction(
-        callback,
+      const afterCommit: AfterCommitTask[] = [];
+      const result = await database.transaction(
+        async (tx) => {
+          afterCommitQueues.set(tx, afterCommit);
+          return await callback(tx);
+        },
         Object.keys(txOptions).length > 0 ? txOptions : undefined
       );
+
+      // The transaction promise resolves only once COMMIT has succeeded
+      afterCommit.forEach(startDetached);
+      return result;
     } catch (error: unknown) {
       lastError = error;
 
@@ -265,6 +325,51 @@ export async function withTransaction<T>(
 
   throw lastError;
 }
+
+/**
+ * Execute database operations within a nested transaction (a savepoint) of an open one.
+ *
+ * A failure rolls back the nested transaction's work only; the caller may catch it and carry on
+ * with the parent. A savepoint is not a commit, so the after* hooks scheduled inside it are handed
+ * to the parent when it succeeds and dropped when it fails: they start once the outermost
+ * transaction has committed.
+ *
+ * @param parent - An open transaction, opened by withTransaction() or withNestedTransaction()
+ * @param callback - Function to execute within the nested transaction
+ * @returns Result of the callback
+ *
+ * @example
+ * \`\`\`typescript
+ * await withTransaction(async (tx) => {
+ *   await orderDomain.create(order, tx);
+ *   try {
+ *     await withNestedTransaction(tx, async (nested) => {
+ *       await auditDomain.create(entry, nested);
+ *     });
+ *   } catch {
+ *     // the audit entry and its after* hooks are gone, the order stays
+ *   }
+ * });
+ * \`\`\`
+ */
+export const withNestedTransaction = async <T>(
+  parent: DbTransaction,
+  callback: (tx: DbTransaction) => Promise<T>,
+): Promise<T> => {
+  const parentQueue = afterCommitQueues.get(parent);
+  if (!parentQueue) {
+    throw new Error(UNKNOWN_TRANSACTION_MESSAGE);
+  }
+
+  const afterCommit: AfterCommitTask[] = [];
+  const result = await parent.transaction(async (tx) => {
+    afterCommitQueues.set(tx, afterCommit);
+    return await callback(tx);
+  });
+
+  parentQueue.push(...afterCommit);
+  return result;
+};
 
 /**
  * Get SQL instance
