@@ -21,10 +21,10 @@ export class BaseDomainGenerator {
 import { eq, desc, asc, sql, type AnyColumn } from 'drizzle-orm';
 import { type PgTable } from 'drizzle-orm/pg-core';
 import { type ZodSchema } from 'zod';
-import { NotFoundException } from './exceptions.ts';
+import { InvalidFilterException, NotFoundException } from './exceptions.ts';
 import { withoutTransaction, runAfterCommit, type DbTransaction } from '../db/database.ts';
 import { DomainHooks, DomainHookContext, QueryOptions } from './hooks.types.ts';
-import { buildWhereSQL, isWhereFilter, stripUnexposedFields, stripUnacceptedFields, type SQL, type FieldMeta } from '../utils/filter.utils.ts';
+import { buildWhereSQL, isWhereFilter, stripUnexposedFields, stripUnacceptedFields, validateFilter, type SQL, type FieldMeta } from '../utils/filter.utils.ts';
 import { getExposedFields, getCreateUnexposedFields, getReadUnexposedFields, getCreateUnacceptedFields, getUpdateUnacceptedFields } from '../utils/field-meta.utils.ts';
 
 // ============================================
@@ -259,8 +259,13 @@ export abstract class BaseDomain<
     options: QueryOptions = {},
     context?: DomainHookContext<DomainEnvVars>,
   ): Promise<{ data: T[]; total: number }> {
-    // Convert WhereFilter to SQL first (so hooks receive SQL)
+    // Convert WhereFilter to SQL first (so hooks receive SQL). A condition that cannot be applied is
+    // refused: dropping it would widen the result.
     if (options.where && isWhereFilter(options.where)) {
+      const validation = validateFilter(options.where, this.config.fieldMeta);
+      if (!validation.valid) {
+        throw new InvalidFilterException(validation.error ?? 'Invalid filter');
+      }
       options = {
         ...options,
         where: buildWhereSQL(options.where, this.config.table, this.fields.exposedFields),

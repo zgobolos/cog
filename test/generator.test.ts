@@ -1106,3 +1106,90 @@ Deno.test('generator - after* hooks start once their transaction has committed',
     await cleanupAfterCommit();
   }
 });
+
+const WIRING_MODELS = './test/test-wiring-models';
+const WIRING_OUTPUT = './test/test-wiring-generated';
+
+async function cleanupWiring() {
+  for (const p of [WIRING_MODELS, WIRING_OUTPUT]) {
+    try {
+      await Deno.remove(p, { recursive: true });
+    } catch {
+      // Ignore if doesn't exist
+    }
+  }
+}
+
+Deno.test('generator - hook registration, strict domain filters and exported exceptions', async () => {
+  await cleanupWiring();
+  try {
+    await Deno.mkdir(WIRING_MODELS, { recursive: true });
+    const idField = { name: 'id', type: 'uuid', primaryKey: true, defaultValue: 'gen_random_uuid()', required: true };
+    const author = {
+      name: 'Author',
+      tableName: 'author',
+      fields: [idField],
+      relationships: [
+        { type: 'oneToMany', name: 'bookList', target: 'Book', foreignKey: 'authorId' },
+        { type: 'manyToMany', name: 'genreList', target: 'Genre', through: 'author_genre' },
+      ],
+    };
+    // A hidden foreign key: the author's bookList include has to filter on it anyway
+    const book = {
+      name: 'Book',
+      tableName: 'book',
+      fields: [idField, {
+        name: 'authorId',
+        type: 'uuid',
+        expose: 'hidden',
+        references: { model: 'Author', field: 'id' },
+      }],
+      relationships: [{ type: 'manyToOne', name: 'author', target: 'Author', foreignKey: 'authorId' }],
+    };
+    const genre = { name: 'Genre', tableName: 'genre', fields: [idField] };
+    for (const [file, model] of [['author', author], ['book', book], ['genre', genre]] as const) {
+      await Deno.writeTextFile(`${WIRING_MODELS}/${file}.json`, JSON.stringify(model, null, 2));
+    }
+    await generateFromModels(WIRING_MODELS, WIRING_OUTPUT);
+
+    const read = (path: string): Promise<string> => Deno.readTextFile(`${WIRING_OUTPUT}/${path}`);
+    const index = await read('index.ts');
+    const authorDomain = await read('domain/author.domain.ts');
+    const authorRest = await read('rest/author.rest.ts');
+    const helpers = await read('rest/helpers.ts');
+
+    // domainHooks is typed per model, and junction hooks reach the domain constructor
+    assertEquals(index.includes('[modelName: string]: unknown'), false);
+    assertEquals(index.includes("domainHooks?: DomainHooksConfig<Env['Variables']>;"), true);
+    assertEquals(index.includes('genreListJunctionHooks?: domain.JunctionTableHooks<Vars>;'), true);
+    assertEquals(index.includes('const { genreListJunctionHooks, ...authorHooks } = config.domainHooks.author;'), true);
+    assertEquals(index.includes('new domain.AuthorDomain(authorHooks, genreListJunctionHooks)'), true);
+    assertEquals(index.includes('new domain.BookDomain(config.domainHooks.book)'), true);
+    // The many-to-many handlers hand the request context to the domain, like the CRUD handlers
+    assertEquals(authorRest.includes('addGenreList(id, ids, body, tx, c.var)'), true);
+    assertEquals(authorRest.includes('removeGenre(id, relatedId, body, tx, c.var)'), true);
+
+    // findMany refuses a filter it cannot apply instead of dropping the condition
+    assertEquals(authorDomain.includes('validateFilter(options.where, authorFieldMeta)'), true);
+    assertEquals(authorDomain.includes("throw new InvalidFilterException(validation.error ?? 'Invalid filter')"), true);
+    assertEquals(
+      /if \(error instanceof InvalidFilterException\) \{\s*\n\s*throw new HTTPException\(400/.test(helpers),
+      true,
+    );
+
+    // Relation includes filter with SQL, which does not depend on the exposure of the foreign key
+    assertEquals(authorDomain.includes('where: eq(bookTable.authorId, id)'), true);
+    assertEquals(authorDomain.includes('where: inArray(bookTable.authorId, resultIds)'), true);
+    assertEquals(authorDomain.includes('where: inArray(genreTable.id, genreListTargetIds)'), true);
+    assertEquals(/op: '(eq|in)', value/.test(authorDomain), false);
+
+    // The exceptions reach generated/index.ts through domain/index.ts
+    assertEquals((await read('domain/index.ts')).includes("export * from './exceptions.ts';"), true);
+    assertEquals(
+      (await read('domain/exceptions.ts')).includes('export class InvalidFilterException extends DomainException'),
+      true,
+    );
+  } finally {
+    await cleanupWiring();
+  }
+});

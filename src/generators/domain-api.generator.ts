@@ -103,7 +103,7 @@ export interface DomainHooks<T, CreateInput, UpdateInput, DomainEnvVars extends 
   // Before-operation hooks (outside transaction, before validation)
   // Note: These run BEFORE any validation, receive raw input
   // Note: Can transform input, perform auth checks, or reject requests
-  // Note: Throwing an exception prevents the operation (transaction never starts)
+  // Note: Throwing an exception aborts the operation before anything is written
   // Note: NO transaction parameter - runs outside transaction like after hooks
   beforeCreate?: (rawInput: unknown, context?: DomainHookContext<DomainEnvVars>) => Promise<unknown>;
   beforeUpdate?: (id: string, rawInput: unknown, context?: DomainHookContext<DomainEnvVars>) => Promise<unknown>;
@@ -145,9 +145,9 @@ export interface DomainHooks<T, CreateInput, UpdateInput, DomainEnvVars extends 
  * These hooks run at the domain layer within database transactions.
  * For batch operations (addMultiple, removeMultiple), the singular hooks are called for each item.
  *
- * The hook functions receive an object with field names matching the junction table's foreign keys.
- * For example, for a user_roles table with user_id and role_id fields:
- * preAddJunction({ user_id: '123', role_id: '456' }, tx, context)
+ * The hook functions receive an object keyed by the junction table's foreign keys in camelCase.
+ * For example, for a user_role table with user_id and role_id columns:
+ * preAddJunction({ userId: '123', roleId: '456' }, rawInput, tx, context)
  *
  * The generic DomainEnvVars type allows you to specify your Env Variables type for type-safe
  * access to context variables in hooks.
@@ -158,7 +158,7 @@ export interface DomainHooks<T, CreateInput, UpdateInput, DomainEnvVars extends 
 export interface JunctionTableHooks<DomainEnvVars extends Record<string, unknown> = Record<string, unknown>> {
   // Before-operation hooks (outside transaction, before validation)
   // Note: These run BEFORE any validation, receive raw input
-  // Note: Throwing an exception prevents the operation (transaction never starts)
+  // Note: Throwing an exception aborts the operation before anything is written
   // Note: NO transaction parameter - runs outside transaction
   beforeAddJunction?: (ids: Record<string, string>, rawInput: unknown, context?: DomainHookContext<DomainEnvVars>) => Promise<Record<string, string>>;
   beforeRemoveJunction?: (ids: Record<string, string>, rawInput: unknown, context?: DomainHookContext<DomainEnvVars>) => Promise<Record<string, string>>;
@@ -215,13 +215,13 @@ export interface JunctionTableHooks<DomainEnvVars extends Record<string, unknown
       : '';
 
     return `${drizzleImports}
-import { NotFoundException } from './exceptions.ts';
+import { InvalidFilterException, NotFoundException } from './exceptions.ts';
 import { withoutTransaction, runAfterCommit, type DbTransaction } from '../db/database.ts';
 import { ${modelNameLower}Table, type ${modelName}, type New${modelName}, ${modelNameLower}InsertSchema, ${modelNameLower}UpdateSchema, ${modelNameLower}FieldMeta } from '../schema/${modelNameLower}.schema.ts';
 ${this.generateRelationImports(model)}
 ${this.generateJunctionTableImports(model)}
 import { DomainHooks, JunctionTableHooks, DomainHookContext, QueryOptions } from './hooks.types.ts';
-import { buildWhereSQL, isWhereFilter, stripUnexposedFields, stripUnacceptedFields, type SQL } from '../utils/filter.utils.ts';
+import { buildWhereSQL, isWhereFilter, stripUnexposedFields, stripUnacceptedFields, validateFilter, type SQL } from '../utils/filter.utils.ts';
 import { getExposedFields, getCreateUnexposedFields, getReadUnexposedFields, getCreateUnacceptedFields, getUpdateUnacceptedFields } from '../utils/field-meta.utils.ts';
 ${junctionUtilImports}
 
@@ -360,8 +360,13 @@ export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = 
     options: QueryOptions = {},
     context?: DomainHookContext<DomainEnvVars>,
   ): Promise<{ data: ${modelName}[]; total: number }> {
-    // Convert WhereFilter to SQL first (so hooks receive SQL, not raw filter objects)
+    // Convert WhereFilter to SQL first (so hooks receive SQL, not raw filter objects). A condition that
+    // cannot be applied is refused: dropping it would widen the result.
     if (options.where && isWhereFilter(options.where)) {
+      const validation = validateFilter(options.where, ${modelNameLower}FieldMeta);
+      if (!validation.valid) {
+        throw new InvalidFilterException(validation.error ?? 'Invalid filter');
+      }
       options = {
         ...options,
         where: buildWhereSQL(options.where, ${modelNameLower}Table, ${modelNameLower}ExposedFields),
@@ -612,20 +617,21 @@ export const ${modelNameLower}Domain = new ${modelName}Domain();
     const addedDomainImports = new Set<string>();
 
     for (const rel of model.relationships) {
-      // Schema imports for junction tables (manyToMany still needs direct table access)
+      // Junction tables of many-to-many relationships
       if (rel.type === 'manyToMany' && rel.through && !addedSchemaImports.has(rel.through)) {
         schemaImports.push(
           `import { ${rel.through.toLowerCase()}Table } from '../schema/${rel.through.toLowerCase()}.schema.ts';`,
         );
         addedSchemaImports.add(rel.through);
+      }
 
-        // Also import target table and type for manyToMany get* methods (skip self-referential)
-        if (rel.target !== model.name && !addedSchemaImports.has(rel.target)) {
-          schemaImports.push(
-            `import { ${rel.target.toLowerCase()}Table, type ${rel.target} } from '../schema/${rel.target.toLowerCase()}.schema.ts';`,
-          );
-          addedSchemaImports.add(rel.target);
-        }
+      // Target table for the SQL conditions of relation includes, and target type for the many-to-many
+      // get* methods; a self-reference uses this model's own table and type
+      if (rel.target !== model.name && !addedSchemaImports.has(rel.target)) {
+        schemaImports.push(
+          `import { ${rel.target.toLowerCase()}Table, type ${rel.target} } from '../schema/${rel.target.toLowerCase()}.schema.ts';`,
+        );
+        addedSchemaImports.add(rel.target);
       }
 
       // Domain imports for related entities (skip self-referential - will use this.findById/findMany)
@@ -658,6 +664,8 @@ export const ${modelNameLower}Domain = new ${modelName}Domain();
       const targetDomain = rel.target === model.name
         ? 'this' // Self-referential
         : `${rel.target.toLowerCase()}Domain`;
+      // Relation includes filter the target with SQL, which does not depend on field exposure
+      const targetTable = `${(rel.target === model.name ? model.name : rel.target).toLowerCase()}Table`;
 
       code += `        if (options.include.includes('${rel.name}')) {\n`;
 
@@ -677,7 +685,7 @@ export const ${modelNameLower}Domain = new ${modelName}Domain();
         const foreignKey = rel.foreignKey || model.name.toLowerCase() + 'Id';
         code += `          // Load ${rel.name} (oneToMany) via domain\n`;
         code += `          const { data: ${rel.name} } = await ${targetDomain}.findMany(tx, {\n`;
-        code += `            where: { and: [{ field: '${foreignKey}', op: 'eq', value: id }] },\n`;
+        code += `            where: eq(${targetTable}.${foreignKey}, id),\n`;
         code += `            skipSanitization: options.skipSanitization\n`;
         code += `          });\n`;
         code += `          (found as unknown as Record<string, unknown>).${rel.name} = ${rel.name};\n`;
@@ -694,7 +702,7 @@ export const ${modelNameLower}Domain = new ${modelName}Domain();
         code += `          const ${rel.name}TargetIds = ${rel.name}JunctionData.map(j => j.targetId);\n`;
         code += `          if (${rel.name}TargetIds.length > 0) {\n`;
         code += `            const { data: ${rel.name} } = await ${targetDomain}.findMany(tx, {\n`;
-        code += `              where: { and: [{ field: 'id', op: 'in', value: ${rel.name}TargetIds }] },\n`;
+        code += `              where: inArray(${targetTable}.id, ${rel.name}TargetIds),\n`;
         code += `              skipSanitization: options.skipSanitization\n`;
         code += `            });\n`;
         code += `            (found as unknown as Record<string, unknown>).${rel.name} = ${rel.name};\n`;
@@ -720,7 +728,7 @@ export const ${modelNameLower}Domain = new ${modelName}Domain();
           const foreignKey = rel.foreignKey || model.name.toLowerCase() + 'Id';
           code += `          // Load ${rel.name} (oneToOne - inverse) via domain\n`;
           code += `          const { data: ${rel.name}List } = await ${targetDomain}.findMany(tx, {\n`;
-          code += `            where: { and: [{ field: '${foreignKey}', op: 'eq', value: id }] },\n`;
+          code += `            where: eq(${targetTable}.${foreignKey}, id),\n`;
           code += `            limit: 1,\n`;
           code += `            skipSanitization: options.skipSanitization\n`;
           code += `          });\n`;
@@ -752,6 +760,8 @@ export const ${modelNameLower}Domain = new ${modelName}Domain();
       const targetDomain = rel.target === model.name
         ? 'this' // Self-referential
         : `${rel.target.toLowerCase()}Domain`;
+      // Relation includes filter the target with SQL, which does not depend on field exposure
+      const targetTable = `${(rel.target === model.name ? model.name : rel.target).toLowerCase()}Table`;
 
       code += `      if (options.include.includes('${rel.name}')) {\n`;
 
@@ -763,7 +773,7 @@ export const ${modelNameLower}Domain = new ${modelName}Domain();
           `        const ${rel.name}Ids = [...new Set(results.map(r => r.${foreignKey}).filter(id => id !== null && id !== undefined))] as string[];\n`;
         code += `        if (${rel.name}Ids.length > 0) {\n`;
         code += `          const { data: ${rel.name}Data } = await ${targetDomain}.findMany(tx, {\n`;
-        code += `            where: { and: [{ field: 'id', op: 'in', value: ${rel.name}Ids }] },\n`;
+        code += `            where: inArray(${targetTable}.id, ${rel.name}Ids),\n`;
         code += `            skipSanitization: options.skipSanitization\n`;
         code += `          });\n`;
         code += `          const ${rel.name}Map = new Map(${rel.name}Data.map(item => [item.id, item]));\n`;
@@ -782,7 +792,7 @@ export const ${modelNameLower}Domain = new ${modelName}Domain();
         code += `        // Load ${rel.name} (oneToMany) for all results via domain\n`;
         code += `        const resultIds = results.map(r => r.id);\n`;
         code += `        const { data: ${rel.name}Data } = await ${targetDomain}.findMany(tx, {\n`;
-        code += `          where: { and: [{ field: '${foreignKey}', op: 'in', value: resultIds }] },\n`;
+        code += `          where: inArray(${targetTable}.${foreignKey}, resultIds),\n`;
         code += `          skipSanitization: options.skipSanitization\n`;
         code += `        });\n`;
         code += `        const ${rel.name}Map = new Map<string, unknown[]>();\n`;
@@ -813,7 +823,7 @@ export const ${modelNameLower}Domain = new ${modelName}Domain();
         code += `        const ${rel.name}TargetIds = [...new Set(${rel.name}JunctionData.map(j => j.targetId))];\n`;
         code += `        if (${rel.name}TargetIds.length > 0) {\n`;
         code += `          const { data: ${rel.name}Data } = await ${targetDomain}.findMany(tx, {\n`;
-        code += `            where: { and: [{ field: 'id', op: 'in', value: ${rel.name}TargetIds }] },\n`;
+        code += `            where: inArray(${targetTable}.id, ${rel.name}TargetIds),\n`;
         code += `            skipSanitization: options.skipSanitization\n`;
         code += `          });\n`;
         code += `          const ${rel.name}EntityMap = new Map(${rel.name}Data.map(item => [item.id, item]));\n`;
@@ -846,7 +856,7 @@ export const ${modelNameLower}Domain = new ${modelName}Domain();
             `        const ${rel.name}Ids = [...new Set(results.map(r => r.${foreignKey}).filter(id => id !== null && id !== undefined))] as string[];\n`;
           code += `        if (${rel.name}Ids.length > 0) {\n`;
           code += `          const { data: ${rel.name}Data } = await ${targetDomain}.findMany(tx, {\n`;
-          code += `            where: { and: [{ field: 'id', op: 'in', value: ${rel.name}Ids }] },\n`;
+          code += `            where: inArray(${targetTable}.id, ${rel.name}Ids),\n`;
           code += `            skipSanitization: options.skipSanitization\n`;
           code += `          });\n`;
           code += `          const ${rel.name}Map = new Map(${rel.name}Data.map(item => [item.id, item]));\n`;
@@ -865,7 +875,7 @@ export const ${modelNameLower}Domain = new ${modelName}Domain();
           code += `        // Load ${rel.name} (oneToOne - inverse) for all results via domain\n`;
           code += `        const resultIds = results.map(r => r.id);\n`;
           code += `        const { data: ${rel.name}Data } = await ${targetDomain}.findMany(tx, {\n`;
-          code += `          where: { and: [{ field: '${foreignKey}', op: 'in', value: resultIds }] },\n`;
+          code += `          where: inArray(${targetTable}.${foreignKey}, resultIds),\n`;
           code += `          skipSanitization: options.skipSanitization\n`;
           code += `        });\n`;
           code += `        const ${rel.name}Map = new Map<string, unknown>();\n`;
@@ -1071,6 +1081,7 @@ export const ${modelNameLower}Domain = new ${modelName}Domain();
     }
 
     code += `export * from './hooks.types.ts';\n`;
+    code += `export * from './exceptions.ts';\n`;
 
     return code;
   }

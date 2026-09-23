@@ -192,6 +192,51 @@ export * from './field-meta.utils.ts';
 }
 
 /**
+ * The many-to-many relations of a model, in the order its domain constructor takes their junction hooks
+ */
+const manyToManyRelations = (model: ModelDefinition): string[] =>
+  (model.relationships ?? []).filter((rel) => rel.type === 'manyToMany').map((rel) => rel.name);
+
+/**
+ * The hooks entry of one model in DomainHooksConfig: its domain hooks plus its junction hooks
+ */
+const generateHooksConfigEntry = (model: ModelDefinition): string => {
+  const hooksType =
+    `domain.DomainHooks<schema.${model.name}, schema.New${model.name}, Partial<schema.New${model.name}>, Vars>`;
+  const relations = manyToManyRelations(model);
+  if (relations.length === 0) {
+    return `  ${model.name.toLowerCase()}?: ${hooksType};`;
+  }
+  const junctionHooks = relations
+    .map((relation) => `    ${relation}JunctionHooks?: domain.JunctionTableHooks<Vars>;`)
+    .join('\n');
+  return `  ${model.name.toLowerCase()}?: ${hooksType} & {\n${junctionHooks}\n  };`;
+};
+
+/**
+ * Rebuilds a model's domain singleton with the hooks from the initialization config
+ */
+const generateHooksRegistration = (model: ModelDefinition): string => {
+  const key = model.name.toLowerCase();
+  const relations = manyToManyRelations(model);
+  if (relations.length === 0) {
+    return `
+  if (config.domainHooks?.${key}) {
+    Object.assign(domain.${key}Domain, new domain.${model.name}Domain(config.domainHooks.${key}));
+  }`;
+  }
+  const junctionHooks = relations.map((relation) => `${relation}JunctionHooks`);
+  return `
+  if (config.domainHooks?.${key}) {
+    const { ${junctionHooks.join(', ')}, ...${key}Hooks } = config.domainHooks.${key};
+    Object.assign(
+      domain.${key}Domain,
+      new domain.${model.name}Domain(${key}Hooks, ${junctionHooks.join(', ')}),
+    );
+  }`;
+};
+
+/**
  * Generate main index file
  */
 function generateMainIndex(models: ModelDefinition[]): string {
@@ -207,6 +252,14 @@ import { registerRestRoutes, ${models.map((m) => `initialize${m.name}RestRoutes`
 import * as domain from './domain/index.ts';
 import * as schema from './schema/index.ts';
 
+/**
+ * Hooks per model, keyed by the model name in lower case: the model's domain hooks, plus the junction
+ * hooks of its many-to-many relations under <relation>JunctionHooks
+ */
+export interface DomainHooksConfig<Vars extends Record<string, unknown> = Record<string, unknown>> {
+${models.map(generateHooksConfigEntry).join('\n')}
+}
+
 // Generic initialization config - works with any Hono Env type
 export interface InitializationConfig<Env extends { Variables: Record<string, unknown> } = { Variables: Record<string, unknown> }> {
   database: DatabaseConfig;
@@ -221,9 +274,7 @@ export interface InitializationConfig<Env extends { Variables: Record<string, un
     warn?: (message: string, ...args: unknown[]) => void;
     error?: (message: string, ...args: unknown[]) => void;
   };
-  domainHooks?: {
-    [modelName: string]: unknown;
-  };
+  domainHooks?: DomainHooksConfig<Env['Variables']>;
 }
 
 /**
@@ -235,22 +286,8 @@ export async function initializeGenerated<Env extends { Variables: Record<string
   // Initialize database
   const { db, sql } = await connect(config.database, config.logging);
 
-  // Initialize domain layers with hooks if provided
-  if (config.domainHooks) {
-    ${
-    models
-      .map(
-        (m) => `
-    if (config.domainHooks.${m.name.toLowerCase()}) {
-      Object.assign(domain.${m.name.toLowerCase()}Domain,
-        new domain.${m.name}Domain(
-        config.domainHooks.${m.name.toLowerCase()}
-      ));
-    }`,
-      )
-      .join('')
-  }
-  }
+  // Rebuild the domain singletons the REST routes use with the hooks provided
+${models.map(generateHooksRegistration).join('\n')}
 
   // Register REST routes
   registerRestRoutes(config.app, config.api?.basePath);

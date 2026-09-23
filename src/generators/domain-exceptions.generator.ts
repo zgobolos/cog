@@ -37,6 +37,18 @@ export class NotFoundException extends DomainException {
     this.name = 'NotFoundException';
   }
 }
+
+/**
+ * Thrown when a filter cannot be applied: an unknown or hidden field, an operator the field type does
+ * not support, or a value of the wrong shape. Dropping the condition instead would widen the result.
+ * Typically maps to HTTP 400 Bad Request
+ */
+export class InvalidFilterException extends DomainException {
+  constructor(message: string) {
+    super(message);
+    this.name = 'InvalidFilterException';
+  }
+}
 `;
   }
 }

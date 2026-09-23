@@ -149,7 +149,7 @@ export type DefaultEnv = {
   private generateRestHelpers(): string {
     return `import { HTTPException } from '@hono/hono/http-exception';
 import type { Context } from '@hono/hono';
-import { NotFoundException, DomainException } from '../domain/exceptions.ts';
+import { NotFoundException, InvalidFilterException, DomainException } from '../domain/exceptions.ts';
 
 // Re-export filter utilities for use in REST handlers
 export {
@@ -265,6 +265,10 @@ export function handleDomainException(error: unknown, operation?: 'delete'): nev
   if (error instanceof NotFoundException) {
     throw new HTTPException(404, { message: error.message });
   }
+  // A filter the domain cannot apply - unknown or hidden field, unsupported operator - is the caller's mistake
+  if (error instanceof InvalidFilterException) {
+    throw new HTTPException(400, { message: error.message });
+  }
   if (error instanceof DomainException) {
     throw new HTTPException(500, { message: error.message });
   }
@@ -341,7 +345,7 @@ export function handleDomainException(error: unknown, operation?: 'delete'): nev
         const ids = body.ids || [];
 
         await withTransaction(async (tx) => {
-          await ${modelNameLower}Domain.add${RelName}(id, ids, body, tx);
+          await ${modelNameLower}Domain.add${RelName}(id, ids, body, tx, c.var);
         });
 
         return c.json({ data: { message: '${relName} added successfully' } }, 201);
@@ -363,7 +367,7 @@ export function handleDomainException(error: unknown, operation?: 'delete'): nev
         const relatedId = body.id;
 
         await withTransaction(async (tx) => {
-          await ${modelNameLower}Domain.add${SingularRelName}(id, relatedId, body, tx);
+          await ${modelNameLower}Domain.add${SingularRelName}(id, relatedId, body, tx, c.var);
         });
 
         return c.json({ data: { message: '${singularRelName} added successfully' } }, 201);
@@ -387,7 +391,7 @@ export function handleDomainException(error: unknown, operation?: 'delete'): nev
         const ids = body.ids || [];
 
         await withTransaction(async (tx) => {
-          await ${modelNameLower}Domain.set${RelName}(id, ids, body, tx);
+          await ${modelNameLower}Domain.set${RelName}(id, ids, body, tx, c.var);
         });
 
         return c.json({ data: { message: '${relName} updated successfully' } });
@@ -411,7 +415,7 @@ export function handleDomainException(error: unknown, operation?: 'delete'): nev
         const relatedId = body.id;
 
         await withTransaction(async (tx) => {
-          await ${modelNameLower}Domain.remove${SingularRelName}(id, relatedId, body, tx);
+          await ${modelNameLower}Domain.remove${SingularRelName}(id, relatedId, body, tx, c.var);
         });
 
         return c.json({ data: { message: '${singularRelName} removed successfully' } });
@@ -433,7 +437,7 @@ export function handleDomainException(error: unknown, operation?: 'delete'): nev
         const ids = body.ids || [];
 
         await withTransaction(async (tx) => {
-          await ${modelNameLower}Domain.remove${RelName}(id, ids, body, tx);
+          await ${modelNameLower}Domain.remove${RelName}(id, ids, body, tx, c.var);
         });
 
         return c.json({ data: { message: '${relName} removed successfully' } });

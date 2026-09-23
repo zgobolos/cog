@@ -13,21 +13,27 @@
  */
 
 import { assert, assertEquals, assertExists, assertMatch } from '@std/assert';
+import { eq } from 'drizzle-orm';
 import {
   type AcceptanceTestEntity,
   type Assignment,
   type Department,
   type Employee,
   type ExposureTestEntity,
+  exposuretestentityDomain,
+  exposuretestentityTable,
   getSQL,
   type IDCard,
+  InvalidFilterException,
   type Project,
   type Skill,
   SkillDomain,
+  skillDomain,
   withNestedTransaction,
   withoutTransaction,
   withTransaction,
 } from '../generated/index.ts';
+import { hookCalls } from '../src/hook-probe.ts';
 import { type ServerHandle, startServer } from '../src/main.ts';
 
 // ============================================================================
@@ -1487,6 +1493,96 @@ async function runTests(): Promise<void> {
     await DELETE(`/api/skill/${id}`);
   }
   logSuccess('✓ after* hooks start after COMMIT; rollback, retry and a failed savepoint drop them');
+
+  // ========================================
+  // 21. JUNCTION HOOKS REGISTERED THROUGH initializeGenerated
+  // ========================================
+  logSection('21. Testing Junction Hooks Registered Through initializeGenerated');
+
+  // src/main.ts passes skillListJunctionHooks inside domainHooks.employee; the hooks record their calls,
+  // and the middleware sets someString on every request.
+  logStep('21.1 Adding a skill over REST runs the add hooks with the request context');
+  const junctionEmployee = await POST('/api/employee', {
+    firstName: 'Junction',
+    lastName: 'Probe',
+    email: `junction.${crypto.randomUUID().slice(0, 8)}@example.com`,
+    departmentId: createdIds.departments[0],
+  }) as Employee;
+  const junctionSkillId = createdIds.skills[0];
+  hookCalls.length = 0;
+  await POST(`/api/employee/${junctionEmployee.id}/skill`, { id: junctionSkillId });
+  await waitUntil(() => hookCalls.some((call) => call.hook === 'skillList.afterAddJunction'), 'afterAddJunction');
+  assertEquals(
+    hookCalls.map((call) => call.hook),
+    [
+      'skillList.beforeAddJunction',
+      'skillList.preAddJunction',
+      'skillList.postAddJunction',
+      'skillList.afterAddJunction',
+    ],
+    'the junction hooks from initializeGenerated must run, in lifecycle order',
+  );
+  assert(
+    hookCalls.every((call) => typeof call.context?.someString === 'string'),
+    'every junction hook must receive the request context',
+  );
+
+  logStep('21.2 Removing it runs the remove hooks');
+  hookCalls.length = 0;
+  const removedLink = await REQUEST('DELETE', `/api/employee/${junctionEmployee.id}/skill`, { id: junctionSkillId });
+  assertEquals(removedLink.status, 200, 'removing the link succeeds');
+  await waitUntil(() => hookCalls.some((call) => call.hook === 'skillList.afterRemoveJunction'), 'afterRemoveJunction');
+  assertEquals(
+    hookCalls.map((call) => call.hook),
+    [
+      'skillList.beforeRemoveJunction',
+      'skillList.preRemoveJunction',
+      'skillList.postRemoveJunction',
+      'skillList.afterRemoveJunction',
+    ],
+    'the remove hooks must run, in lifecycle order',
+  );
+
+  await DELETE(`/api/employee/${junctionEmployee.id}`);
+  logSuccess('✓ Junction hooks registered through initializeGenerated run, with the request context');
+
+  // ========================================
+  // 22. FILTER VALIDATION IN THE DOMAIN
+  // ========================================
+  logSection('22. Testing Filter Validation in the Domain');
+
+  // The domain used to drop a condition it could not apply, so the filter matched every row.
+  logStep('22.1 A filter on an unknown field is refused');
+  const unknownField = await skillDomain.findMany(undefined, { where: { field: 'nope', op: 'eq', value: 1 } })
+    .catch((error: unknown) => error);
+  assert(unknownField instanceof InvalidFilterException, 'an unknown field must raise InvalidFilterException');
+
+  logStep('22.2 A filter on a hidden field is refused');
+  const hiddenField = await exposuretestentityDomain.findMany(undefined, {
+    where: { field: 'hiddenField', op: 'eq', value: 'secret' },
+  }).catch((error: unknown) => error);
+  assert(hiddenField instanceof InvalidFilterException, 'a hidden field must raise InvalidFilterException');
+
+  logStep('22.3 An operator the field type does not support is refused');
+  const unsupportedOperator = await skillDomain.findMany(undefined, { where: { field: 'name', op: 'gt', value: 'a' } })
+    .catch((error: unknown) => error);
+  assert(
+    unsupportedOperator instanceof InvalidFilterException,
+    'gt on a string field must raise InvalidFilterException',
+  );
+
+  logStep('22.4 A SQL condition on a hidden column still works for server-side code');
+  const hiddenValue = `hidden-${crypto.randomUUID()}`;
+  const sqlProbe = await POST('/api/exposuretestentity', {
+    normalField: 'SQL filter probe',
+    hiddenField: hiddenValue,
+  }) as ExposureTestEntity;
+  const bySql = await exposuretestentityDomain.findMany(undefined, {
+    where: eq(exposuretestentityTable.hiddenField, hiddenValue),
+  });
+  assertEquals(bySql.data.map((row) => row.id), [sqlProbe.id], 'the SQL condition selects exactly the probe row');
+  await DELETE(`/api/exposuretestentity/${sqlProbe.id}`);
+  logSuccess('✓ The domain refuses filters it cannot apply; SQL conditions reach hidden columns');
 
   // ========================================
   // SUCCESS

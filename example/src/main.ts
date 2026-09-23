@@ -10,6 +10,7 @@ import type { Employee, NewEmployee } from '../generated/schema/index.ts';
 import { employeeTable } from '../generated/schema/employee.schema.ts';
 import { buildOpenAPISpec } from '../generated/rest/openapi.ts';
 import type { ExampleEnv } from './context.ts';
+import { recordHook } from './hook-probe.ts';
 
 export interface ServerConfig {
   port?: number;
@@ -193,7 +194,7 @@ export async function startServer(config: ServerConfig = {}): Promise<ServerHand
 
         preFindById: (
           _id: string,
-          _tx: DbTransaction,
+          _tx?: DbTransaction,
           _context?: DomainHookContext<ExampleEnv['Variables']>,
         ): Promise<{ id: string }> => {
           console.log('Employee.preFindById');
@@ -203,7 +204,7 @@ export async function startServer(config: ServerConfig = {}): Promise<ServerHand
         postFindById: (
           _id: string,
           result: Employee | null,
-          _tx: DbTransaction,
+          _tx?: DbTransaction,
           _context?: DomainHookContext<ExampleEnv['Variables']>,
         ): Promise<Employee | null> => {
           console.log('Employee.postFindById');
@@ -233,7 +234,7 @@ export async function startServer(config: ServerConfig = {}): Promise<ServerHand
         },
 
         preFindMany: (
-          _tx: DbTransaction,
+          _tx?: DbTransaction,
           options?: QueryOptions,
           _context?: DomainHookContext<ExampleEnv['Variables']>,
         ): Promise<QueryOptions> => {
@@ -244,7 +245,7 @@ export async function startServer(config: ServerConfig = {}): Promise<ServerHand
         postFindMany: (
           _options: QueryOptions,
           results: Employee[],
-          _tx: DbTransaction,
+          _tx?: DbTransaction,
           _context?: DomainHookContext<ExampleEnv['Variables']>,
         ): Promise<Employee[]> => {
           console.log('Employee.postFindMany');
@@ -256,9 +257,10 @@ export async function startServer(config: ServerConfig = {}): Promise<ServerHand
           beforeAddJunction: (
             ids: Record<string, string>,
             _rawInput: unknown,
-            _context?: DomainHookContext<ExampleEnv['Variables']>,
+            context?: DomainHookContext<ExampleEnv['Variables']>,
           ): Promise<Record<string, string>> => {
             console.log('Employee.skillList.beforeAddJunction - outside transaction');
+            recordHook('skillList.beforeAddJunction', context);
             return Promise.resolve(ids);
           },
 
@@ -266,9 +268,10 @@ export async function startServer(config: ServerConfig = {}): Promise<ServerHand
             ids: Record<string, string>,
             _rawInput: unknown,
             _tx: DbTransaction,
-            _context?: DomainHookContext<ExampleEnv['Variables']>,
+            context?: DomainHookContext<ExampleEnv['Variables']>,
           ): Promise<{ ids: Record<string, string> }> => {
             console.log('Employee.skillList.preAddJunction');
+            recordHook('skillList.preAddJunction', context);
             return Promise.resolve({ ids });
           },
 
@@ -276,27 +279,30 @@ export async function startServer(config: ServerConfig = {}): Promise<ServerHand
             _ids: Record<string, string>,
             _rawInput: unknown,
             _tx: DbTransaction,
-            _context?: DomainHookContext<ExampleEnv['Variables']>,
+            context?: DomainHookContext<ExampleEnv['Variables']>,
           ): Promise<void> => {
             console.log('Employee.skillList.postAddJunction');
+            recordHook('skillList.postAddJunction', context);
             return Promise.resolve();
           },
 
           afterAddJunction: (
             _ids: Record<string, string>,
             _rawInput: unknown,
-            _context?: DomainHookContext<ExampleEnv['Variables']>,
+            context?: DomainHookContext<ExampleEnv['Variables']>,
           ): Promise<void> => {
             console.log('Employee.skillList.afterAddJunction - async side effect');
+            recordHook('skillList.afterAddJunction', context);
             return Promise.resolve();
           },
 
           beforeRemoveJunction: (
             ids: Record<string, string>,
             _rawInput: unknown,
-            _context?: DomainHookContext<ExampleEnv['Variables']>,
+            context?: DomainHookContext<ExampleEnv['Variables']>,
           ): Promise<Record<string, string>> => {
             console.log('Employee.skillList.beforeRemoveJunction - outside transaction');
+            recordHook('skillList.beforeRemoveJunction', context);
             return Promise.resolve(ids);
           },
 
@@ -304,9 +310,10 @@ export async function startServer(config: ServerConfig = {}): Promise<ServerHand
             ids: Record<string, string>,
             _rawInput: unknown,
             _tx: DbTransaction,
-            _context?: DomainHookContext<ExampleEnv['Variables']>,
+            context?: DomainHookContext<ExampleEnv['Variables']>,
           ): Promise<{ ids: Record<string, string> }> => {
             console.log('Employee.skillList.preRemoveJunction');
+            recordHook('skillList.preRemoveJunction', context);
             return Promise.resolve({ ids });
           },
 
@@ -314,18 +321,20 @@ export async function startServer(config: ServerConfig = {}): Promise<ServerHand
             _ids: Record<string, string>,
             _rawInput: unknown,
             _tx: DbTransaction,
-            _context?: DomainHookContext<ExampleEnv['Variables']>,
+            context?: DomainHookContext<ExampleEnv['Variables']>,
           ): Promise<void> => {
             console.log('Employee.skillList.postRemoveJunction');
+            recordHook('skillList.postRemoveJunction', context);
             return Promise.resolve();
           },
 
           afterRemoveJunction: (
             _ids: Record<string, string>,
             _rawInput: unknown,
-            _context?: DomainHookContext<ExampleEnv['Variables']>,
+            context?: DomainHookContext<ExampleEnv['Variables']>,
           ): Promise<void> => {
             console.log('Employee.skillList.afterRemoveJunction - async side effect');
+            recordHook('skillList.afterRemoveJunction', context);
             return Promise.resolve();
           },
         },

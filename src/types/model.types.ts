@@ -94,7 +94,7 @@ export interface ModelEndpointConfig {
 export interface RelationshipEndpointConfig {
   get?: boolean; // GET /api/{model}/:id/{relation}List (default: true)
   add?: boolean; // POST /api/{model}/:id/{relation}List (default: true)
-  remove?: boolean; // DELETE /api/{model}/:id/{relation}List/:relatedId (default: true)
+  remove?: boolean; // DELETE /api/{model}/:id/{relation}List and /:id/{singular}, JSON body (default: true)
   replace?: boolean; // PUT /api/{model}/:id/{relation}List (default: true)
 }
 

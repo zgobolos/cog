@@ -95,7 +95,7 @@ generated/
 │   ├── [model].domain.ts       # CRUD operations with hooks (per-model)
 │   ├── base.domain.ts          # Abstract base class with shared CRUD logic
 │   ├── junction.utils.ts       # Many-to-many relationship utilities
-│   ├── exceptions.ts           # DomainException, NotFoundException
+│   ├── exceptions.ts           # DomainException, NotFoundException, InvalidFilterException
 │   └── hooks.types.ts          # Hook type definitions
 ├── utils/
 │   ├── filter.utils.ts         # Filter parsing & SQL building
@@ -269,9 +269,14 @@ applied to array fields (`"array": true`), where a length check would constrain 
 **Many-to-Many Endpoints:**
 
 ```
-GET    /:id/{relation}List     POST   /:id/{relation}List     POST   /:id/{relation}
-PUT    /:id/{relation}List     DELETE /:id/{relation}List     DELETE /:id/{relation}/:targetId
+GET    /:id/{relation}List                         list the targets
+POST   /:id/{relation}List   { "ids": [...] }      add several        POST   /:id/{singular}   { "id": "..." }   add one
+PUT    /:id/{relation}List   { "ids": [...] }      replace all
+DELETE /:id/{relation}List   { "ids": [...] }      remove several     DELETE /:id/{singular}   { "id": "..." }   remove one
 ```
+
+`{singular}` is the relation name without its `List` suffix. Both `DELETE` endpoints read a JSON body. Like the CRUD
+handlers, they pass the request context (`c.var`) to the domain, so junction hooks see it too.
 
 **Relationship endpoint configuration:**
 
@@ -294,7 +299,16 @@ Before-hook (outside tx) → Zod validation → Begin TX → Pre-hook → Zod �
 
 Same pattern for `Update`, `Delete`, `FindById`, `FindMany`, and junction operations (`AddJunction`, `RemoveJunction`).
 
-**Context**: `{ requestId, userId, metadata }` - set via Hono middleware
+**Context**: the Hono context variables (`c.var`) the app's middleware sets with `c.set()`; the CRUD and many-to-many
+handlers pass them to every domain call, typed through the `DomainEnvVars` generic.
+
+**Registration**: `initializeGenerated({ domainHooks: { <model name in lower case>: hooks } })` rebuilds the domain
+singleton the REST routes use. `domainHooks` is the generated `DomainHooksConfig<Env['Variables']>`: per model
+`DomainHooks<Model, NewModel, Partial<NewModel>, Vars>` plus one `<relation>JunctionHooks?: JunctionTableHooks<Vars>`
+per many-to-many relation. The registration destructures the junction hooks out and passes them to the constructor in
+relation order (`manyToManyRelations` in `src/mod.ts`, the same order as the constructor parameters). It used to pass
+only the whole object as the first argument, which silently dropped every junction hook - the typed config is what makes
+such a mistake a compile error now.
 
 **After-hooks are bound to the transaction's outcome.** A domain method does not start its after-hook, it hands it to
 `runAfterCommit(tx, task)` (generated `db/database.ts`), which queues it on the transaction it runs in:
@@ -321,17 +335,18 @@ connections still saw the old state), ran after a rollback, and ran once per ret
 
 ## Exceptions
 
-Domain layer throws `DomainException` or `NotFoundException`. Zod validation (input schema parse) throws `ZodError`.
-REST layer (`handleDomainException`) converts these to HTTP status codes.
+Domain layer throws `DomainException`, `NotFoundException` or `InvalidFilterException`. Zod validation (input schema
+parse) throws `ZodError`. REST layer (`handleDomainException`) converts these to HTTP status codes.
 
-| Exception               | HTTP Status |
-| ----------------------- | ----------- |
-| `NotFoundException`     | 404         |
-| `ZodError`              | 400         |
-| Malformed JSON body     | 400         |
-| Unique violation        | 409         |
-| Other constraint errors | 400         |
-| `DomainException`       | 500         |
+| Exception                | HTTP Status |
+| ------------------------ | ----------- |
+| `NotFoundException`      | 404         |
+| `InvalidFilterException` | 400         |
+| `ZodError`               | 400         |
+| Malformed JSON body      | 400         |
+| Unique violation         | 409         |
+| Other constraint errors  | 400         |
+| `DomainException`        | 500         |
 
 `ZodError` → 400 carries the Zod issues array as the message, covering all input validation failures (`minLength`,
 `maxLength`, required, enum, type). Exceptions in hooks trigger transaction rollback.
@@ -438,15 +453,20 @@ Filters passed via `where` query parameter as base64-encoded JSON.
 | Boolean: `eq`, `isNull`                                                    |
 | Array: `contains`, `overlaps`, `isNull`                                    |
 
-**Domain filtering**: Use `skipSanitization: true` to access hidden fields in internal calls.
+**Domain filtering**: `findMany` runs `validateFilter` on a `WhereFilter` before converting it and throws
+`InvalidFilterException` (400 over REST) for an unknown or hidden field, an unsupported operator or a value of the wrong
+shape. `buildWhereSQL` silently skips such a condition, which would widen the result - that is why validation comes
+first. Hidden columns are filtered with a drizzle `SQL` condition; `skipSanitization` only controls the stripping of the
+returned rows. Relation includes filter their targets with SQL (`eq`/`inArray` on the target table), never with
+`WhereFilter`s, so they do not depend on the exposure of a foreign key.
 
 ## Database Compatibility
 
-| Feature   | PostgreSQL                           | CockroachDB                |
-| --------- | ------------------------------------ | -------------------------- |
-| Indexes   | BTREE, GIN, GIST, HASH, SPGIST, BRIN | BTREE, GIN, GIST only      |
-| Enums     | All versions                         | v22.2+                     |
-| GEOGRAPHY | Supported                            | Auto-converted to GEOMETRY |
+| Feature   | PostgreSQL                           | CockroachDB           |
+| --------- | ------------------------------------ | --------------------- |
+| Indexes   | BTREE, GIN, GIST, HASH, SPGIST, BRIN | BTREE, GIN, GIST only |
+| Enums     | All versions                         | v22.2+                |
+| GEOGRAPHY | Supported (PostGIS)                  | Native                |
 
 ## CLI
 
