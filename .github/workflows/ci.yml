@@ -70,8 +70,9 @@ jobs:
       - name: Generate code from models
         run: cd example && deno task cog:psql:generate
 
-      - name: Initialize database
-        run: cd example && deno task db:init
+      # db:bootstrap (PostGIS), then drizzle-kit push --force: a fresh database needs no migration history
+      - name: Create the database schema
+        run: cd example && deno task drizzle:push
 
       - name: Run generator tests
         run: deno task test
