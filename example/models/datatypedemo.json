@@ -76,6 +76,24 @@
       "name": "tagsArray",
       "type": "string",
       "array": true
+    },
+    {
+      "name": "requiredTagsArray",
+      "type": "string",
+      "array": true,
+      "required": true,
+      "defaultValue": []
+    },
+    {
+      "name": "jsonbListField",
+      "type": "jsonb",
+      "required": true,
+      "defaultValue": []
+    },
+    {
+      "name": "quotedTextField",
+      "type": "text",
+      "defaultValue": "it's \"quoted\""
     }
   ],
   "indexes": [

@@ -105,8 +105,10 @@ export interface DomainHooks<T, CreateInput, UpdateInput, DomainEnvVars extends 
   // Note: Can transform input, perform auth checks, or reject requests
   // Note: Throwing an exception aborts the operation before anything is written
   // Note: NO transaction parameter - runs outside transaction like after hooks
-  beforeCreate?: (rawInput: unknown, context?: DomainHookContext<DomainEnvVars>) => Promise<unknown>;
-  beforeUpdate?: (id: string, rawInput: unknown, context?: DomainHookContext<DomainEnvVars>) => Promise<unknown>;
+  // Note: beforeCreate/beforeUpdate return the input to validate - a hook that only mutates
+  //       rawInput and returns nothing is a type error, not an empty input at runtime
+  beforeCreate?: (rawInput: unknown, context?: DomainHookContext<DomainEnvVars>) => Promise<Record<string, unknown>>;
+  beforeUpdate?: (id: string, rawInput: unknown, context?: DomainHookContext<DomainEnvVars>) => Promise<Record<string, unknown>>;
   beforeDelete?: (id: string, context?: DomainHookContext<DomainEnvVars>) => Promise<void>;
   beforeFindById?: (id: string, context?: DomainHookContext<DomainEnvVars>) => Promise<string>;
   beforeFindMany?: (options: QueryOptions, context?: DomainHookContext<DomainEnvVars>) => Promise<QueryOptions>;

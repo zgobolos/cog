@@ -48,6 +48,9 @@ export type ExposeType = 'default' | 'hidden' | 'create';
 // "never" - never accepted (server-managed field, must have defaultValue or beforeCreate hook)
 export type AcceptType = 'default' | 'create' | 'never';
 
+// A JSON value, as a model file can write it
+export type DefaultValue = string | number | boolean | null | DefaultValue[] | { [key: string]: DefaultValue };
+
 // Field definition
 export interface FieldDefinition {
   name: string;
@@ -55,7 +58,9 @@ export interface FieldDefinition {
   primaryKey?: boolean;
   unique?: boolean;
   required?: boolean;
-  defaultValue?: string | number | boolean | null;
+  // A value; arrays and objects only for array, json and jsonb fields (e.g. [] or { "a": 1 })
+  defaultValue?: DefaultValue;
+  defaultSql?: string; // SQL expression default (e.g. "gen_random_uuid()"), never quoted; excludes defaultValue
   maxLength?: number; // For string/text type (varchar length for string; Zod max length for both)
   minLength?: number; // For string/text type (Zod min length validation)
   precision?: number; // For decimal type

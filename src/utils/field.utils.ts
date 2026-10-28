@@ -2,7 +2,7 @@
  * Shared field utility functions for code generators
  */
 
-import { AcceptType, ExposeType, ModelDefinition } from '../types/model.types.ts';
+import { AcceptType, ExposeType, FieldDefinition, ModelDefinition } from '../types/model.types.ts';
 import { isPostGISType } from '../constants.ts';
 
 /**
@@ -70,4 +70,14 @@ export const modelsHavePostGISFields = (models: ModelDefinition[]): boolean => {
  */
 export const getCustomSchema = (model: ModelDefinition): string | null => {
   return model.schema && model.schema !== 'public' ? model.schema : null;
+};
+
+/**
+ * The SQL expression of a field's default, or null when the default is a value (or absent).
+ * defaultSql is explicit; a defaultValue string containing '()' is the older convention for it.
+ */
+export const getDefaultSql = (field: FieldDefinition): string | null => {
+  if (field.defaultSql !== undefined) return field.defaultSql;
+  if (typeof field.defaultValue === 'string' && field.defaultValue.includes('()')) return field.defaultValue;
+  return null;
 };

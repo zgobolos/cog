@@ -1213,3 +1213,198 @@ Deno.test('generator - hook registration, strict domain filters and exported exc
     await cleanupWiring();
   }
 });
+
+const MODIFIER_MODELS = './test/test-modifier-models';
+const MODIFIER_OUTPUT = './test/test-modifier-generated';
+
+async function cleanupModifiers() {
+  for (const p of [MODIFIER_MODELS, MODIFIER_OUTPUT]) {
+    try {
+      await Deno.remove(p, { recursive: true });
+    } catch { /* ignore */ }
+  }
+}
+
+async function generateWithModels(models: Record<string, unknown>[]): Promise<void> {
+  await Deno.mkdir(MODIFIER_MODELS, { recursive: true });
+  for (const model of models) {
+    await Deno.writeTextFile(`${MODIFIER_MODELS}/${model.name}.json`, JSON.stringify(model, null, 2));
+  }
+  await generateFromModels(MODIFIER_MODELS, MODIFIER_OUTPUT);
+}
+
+const modifierIdField = {
+  name: 'id',
+  type: 'uuid',
+  primaryKey: true,
+  defaultValue: 'gen_random_uuid()',
+  required: true,
+};
+
+// drizzle's .array() wraps the base builder in a new one that keeps none of its modifiers, so
+// text('x').notNull().array() is a nullable column; and a value default is serialized by drizzle,
+// so '[]' on a jsonb column stores the JSON string "[]".
+Deno.test('generator - array modifiers come first, value defaults are literals', async () => {
+  await cleanupModifiers();
+  try {
+    await generateWithModels([{
+      name: 'Holder',
+      tableName: 'holder',
+      fields: [
+        modifierIdField,
+        { name: 'cities', type: 'text', array: true, required: true },
+        { name: 'emails', type: 'text', array: true, required: true, defaultValue: [] },
+        { name: 'history', type: 'jsonb', required: true, defaultValue: [] },
+        { name: 'settings', type: 'jsonb', defaultValue: { theme: 'light' } },
+        { name: 'flags', type: 'jsonb', defaultSql: "'{}'::jsonb" },
+        { name: 'note', type: 'text', defaultValue: "it's a \\ `note`" },
+        { name: 'token', type: 'uuid', defaultSql: 'gen_random_uuid()' },
+      ],
+    }]);
+    const schema = await Deno.readTextFile(`${MODIFIER_OUTPUT}/schema/holder.schema.ts`);
+
+    assertEquals(schema.includes("cities: text('cities').array().notNull()"), true);
+    assertEquals(schema.includes("emails: text('emails').array().notNull().default([])"), true);
+    assertEquals(/\.notNull\(\)[^,\n]*\.array\(\)/.test(schema), false, '.array() never follows another modifier');
+    assertEquals(schema.includes("history: jsonb('history').notNull().default([])"), true);
+    assertEquals(schema.includes(`settings: jsonb('settings').default({"theme":"light"})`), true);
+    assertEquals(schema.includes("flags: jsonb('flags').default(sql`'{}'::jsonb`)"), true);
+    assertEquals(schema.includes("note: text('note').default('it\\'s a \\\\ `note`')"), true);
+    assertEquals(schema.includes("token: uuid('token').default(sql`gen_random_uuid()`)"), true);
+    assertEquals(schema.includes("id: uuid('id').primaryKey().notNull().default(sql`gen_random_uuid()`)"), true);
+  } finally {
+    await cleanupModifiers();
+  }
+});
+
+Deno.test('parser - rejects defaults that do not fit the column', async () => {
+  const cases: Record<string, unknown>[] = [
+    // '{}' is Postgres' array literal, not an array: drizzle would serialize it as a string
+    { name: 'tags', type: 'text', array: true, defaultValue: '{}' },
+    { name: 'tags', type: 'text', defaultValue: [] },
+    { name: 'code', type: 'text', defaultValue: 'a', defaultSql: "'a'" },
+    { name: 'code', type: 'text', defaultSql: '' },
+  ];
+  for (const field of cases) {
+    await cleanupModifiers();
+    try {
+      await assertRejects(
+        () => generateWithModels([{ name: 'Holder', tableName: 'holder', fields: [modifierIdField, field] }]),
+        Error,
+        'Generation aborted due to validation errors',
+      );
+    } finally {
+      await cleanupModifiers();
+    }
+  }
+});
+
+Deno.test('generator - enums live once in schema/enums.ts and are shared across models', async () => {
+  await cleanupModifiers();
+  try {
+    const transactionType = { name: 'TransactionType', values: ['credit', 'debit'] };
+    await generateWithModels([
+      {
+        name: 'Ledger',
+        tableName: 'ledger',
+        enums: [transactionType],
+        fields: [modifierIdField, { name: 'type', type: 'enum', enumName: 'TransactionType', required: true }],
+      },
+      {
+        name: 'BankLine',
+        tableName: 'bank_line',
+        enums: [transactionType],
+        fields: [modifierIdField, { name: 'type', type: 'enum', enumName: 'TransactionType' }],
+      },
+      // Uses the enum without declaring it
+      {
+        name: 'Budget',
+        tableName: 'budget',
+        fields: [modifierIdField, { name: 'kind', type: 'enum', enumName: 'TransactionType', array: true }],
+      },
+    ]);
+    const read = (path: string): Promise<string> => Deno.readTextFile(`${MODIFIER_OUTPUT}/schema/${path}`);
+
+    const enums = await read('enums.ts');
+    assertEquals(
+      (enums.match(/export const transactiontypeEnum = pgEnum\('transaction_type', \['credit', 'debit'\]\);/g) ?? [])
+        .length,
+      1,
+    );
+    assertEquals((await read('index.ts')).includes("export * from './enums.ts';"), true);
+    for (const [file, column] of [['ledger', 'type'], ['bankline', 'type'], ['budget', 'kind']]) {
+      const schema = await read(`${file}.schema.ts`);
+      assertEquals(schema.includes('pgEnum'), false, `${file} declares no enum of its own`);
+      assertEquals(schema.includes("import { transactiontypeEnum } from './enums.ts';"), true);
+      assertEquals(schema.includes(`transactiontypeEnum('${column}')`), true);
+    }
+    assertEquals((await read('budget.schema.ts')).includes("transactiontypeEnum('kind').array()"), true);
+  } finally {
+    await cleanupModifiers();
+  }
+});
+
+Deno.test('parser - rejects conflicting enum declarations and unknown enums', async () => {
+  const conflicting = [
+    {
+      name: 'Ledger',
+      tableName: 'ledger',
+      enums: [{ name: 'TransactionType', values: ['credit', 'debit'] }],
+      fields: [modifierIdField, { name: 'type', type: 'enum', enumName: 'TransactionType' }],
+    },
+    {
+      name: 'BankLine',
+      tableName: 'bank_line',
+      enums: [{ name: 'TransactionType', values: ['debit', 'credit'] }],
+      fields: [modifierIdField, { name: 'type', type: 'enum', enumName: 'TransactionType' }],
+    },
+  ];
+  const unknown = [{
+    name: 'Ledger',
+    tableName: 'ledger',
+    fields: [modifierIdField, { name: 'type', type: 'enum', enumName: 'Missing' }],
+  }];
+  for (const models of [conflicting, unknown]) {
+    await cleanupModifiers();
+    try {
+      await assertRejects(() => generateWithModels(models), Error, 'Generation aborted due to validation errors');
+    } finally {
+      await cleanupModifiers();
+    }
+  }
+});
+
+// atob() returns latin-1, so every non-ASCII filter value was garbled; btoa() throws outside latin-1.
+Deno.test('generator - filter parameter is UTF-8 base64 or base64url', async () => {
+  await cleanupModifiers();
+  try {
+    await generateWithModels([{ name: 'Holder', tableName: 'holder', fields: [modifierIdField] }]);
+    const filterUtils = await Deno.readTextFile(`${MODIFIER_OUTPUT}/utils/filter.utils.ts`);
+
+    assertEquals(filterUtils.includes('const json = decodeBase64Utf8(whereParam);'), true);
+    assertEquals(filterUtils.includes("new TextDecoder('utf-8', { fatal: true })"), true);
+    assertEquals(filterUtils.includes('atob(whereParam)'), false);
+    assertEquals(filterUtils.includes('btoa(JSON.stringify(filter))'), false);
+    assertEquals(filterUtils.includes("replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '')"), true);
+  } finally {
+    await cleanupModifiers();
+  }
+});
+
+Deno.test('generator - before-hooks must return the input to validate', async () => {
+  await cleanupModifiers();
+  try {
+    await generateWithModels([{ name: 'Holder', tableName: 'holder', fields: [modifierIdField] }]);
+    const hooksTypes = await Deno.readTextFile(`${MODIFIER_OUTPUT}/domain/hooks.types.ts`);
+
+    assertEquals(hooksTypes.includes('Promise<unknown>'), false);
+    assertEquals(
+      hooksTypes.includes(
+        'beforeCreate?: (rawInput: unknown, context?: DomainHookContext<DomainEnvVars>) => Promise<Record<string, unknown>>;',
+      ),
+      true,
+    );
+  } finally {
+    await cleanupModifiers();
+  }
+});

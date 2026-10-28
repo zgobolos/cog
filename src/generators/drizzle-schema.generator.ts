@@ -1,4 +1,10 @@
-import { FieldDefinition, IndexDefinition, ModelDefinition, RelationshipDefinition } from '../types/model.types.ts';
+import {
+  EnumDefinition,
+  FieldDefinition,
+  IndexDefinition,
+  ModelDefinition,
+  RelationshipDefinition,
+} from '../types/model.types.ts';
 import {
   checkConstraintName,
   fieldIndexName,
@@ -10,21 +16,24 @@ import {
 } from '../utils/identifier.utils.ts';
 import {
   getCustomSchema,
+  getDefaultSql,
   getSoftDeleteColumn,
   hasPostGISFields,
   modelsHavePostGISFields,
   normalizeAccept,
   normalizeExpose,
 } from '../utils/field.utils.ts';
-import { capitalize, toSnakeCase } from '../utils/string.utils.ts';
+import { capitalize, escapeTemplateLiteral, toSingleQuotedLiteral, toSnakeCase } from '../utils/string.utils.ts';
 import { isPostGISType } from '../constants.ts';
 import { SpatialUtilsGenerator } from './spatial-utils.generator.ts';
+import { collectEnums, enumVariableName } from '../utils/enum.utils.ts';
 
 /**
  * Generates Drizzle ORM schema files from model definitions
  */
 export class DrizzleSchemaGenerator {
   private models: ModelDefinition[];
+  private enums: Map<string, EnumDefinition>;
   private isCockroachDB: boolean;
   private postgis: boolean;
 
@@ -36,6 +45,7 @@ export class DrizzleSchemaGenerator {
     } = {},
   ) {
     this.models = models;
+    this.enums = collectEnums(models);
     this.isCockroachDB = options.isCockroachDB || false;
     this.postgis = options.postgis !== false;
   }
@@ -53,6 +63,11 @@ export class DrizzleSchemaGenerator {
         `schema/${model.name.toLowerCase()}.schema.ts`,
         schemaContent,
       );
+    }
+
+    // Enums are database types, shared by every table that uses them
+    if (this.enums.size > 0) {
+      schemas.set('schema/enums.ts', this.generateEnumsFile());
     }
 
     // Generate junction tables for manyToMany relationships
@@ -87,13 +102,12 @@ export class DrizzleSchemaGenerator {
     const enhancedModel = this.addForeignKeyFields(model);
 
     const imports = this.generateImports(enhancedModel);
-    const enumDefinitions = this.generateEnumDefinitions(enhancedModel);
     const tableDefinition = this.generateTableDefinition(enhancedModel);
     const typeExports = this.generateTypeExports(enhancedModel);
     const zodSchemas = this.generateZodSchemas(enhancedModel);
     const fieldMetadata = this.generateFieldMetadata(enhancedModel);
 
-    return `${imports}\n\n${enumDefinitions}${tableDefinition}\n\n${typeExports}\n\n${zodSchemas}\n${fieldMetadata}`;
+    return `${imports}\n\n${tableDefinition}\n\n${typeExports}\n\n${zodSchemas}\n${fieldMetadata}`;
   }
 
   /**
@@ -106,12 +120,6 @@ export class DrizzleSchemaGenerator {
     drizzleImports.add('pgTable');
     if (getCustomSchema(model)) {
       drizzleImports.add('pgSchema');
-    }
-
-    // Check if model has enum fields
-    const hasEnums = model.enums && model.enums.length > 0;
-    if (hasEnums) {
-      drizzleImports.add('pgEnum');
     }
 
     // Check if this table has self-referential foreign keys
@@ -160,6 +168,18 @@ export class DrizzleSchemaGenerator {
     // Import spatial utilities if PostGIS fields exist
     if (this.postgis && hasPostGISFields(model)) {
       imports += `import { geoJsonToWKT, wktToGeoJSON, type GeoJSON } from './spatial-utils.ts';\n`;
+    }
+
+    // Import the pgEnums the fields use from the shared enums module
+    const usedEnums = new Set<string>();
+    for (const field of model.fields) {
+      const enumDef = this.findFieldEnum(field);
+      if (enumDef && !enumDef.useBitwise) {
+        usedEnums.add(enumVariableName(enumDef));
+      }
+    }
+    if (usedEnums.size > 0) {
+      imports += `import { ${Array.from(usedEnums).join(', ')} } from './enums.ts';\n`;
     }
 
     // Import other tables referenced by foreign keys in this schema
@@ -211,14 +231,11 @@ export class DrizzleSchemaGenerator {
   }
 
   /**
-   * Generate enum definitions
+   * Generate schema/enums.ts: one pgEnum per enum of all models
    */
-  private generateEnumDefinitions(model: ModelDefinition): string {
-    if (!model.enums || model.enums.length === 0) {
-      return '';
-    }
-
-    let code = '// Enum definitions\n';
+  private generateEnumsFile(): string {
+    let code = `import { pgEnum } from 'drizzle-orm/pg-core';\n\n`;
+    code += '// Enum definitions, shared by every schema that uses them\n';
 
     // Add CockroachDB compatibility note
     if (this.isCockroachDB) {
@@ -226,13 +243,18 @@ export class DrizzleSchemaGenerator {
       code += '// For earlier versions, consider using varchar with CHECK constraints\n';
     }
 
-    for (const enumDef of model.enums) {
-      const enumName = `${enumDef.name.toLowerCase()}Enum`;
-      const values = enumDef.values.map((v) => `'${v}'`).join(', ');
-      code += `export const ${enumName} = pgEnum('${toSnakeCase(enumDef.name)}', [${values}]);\n`;
+    for (const enumDef of this.enums.values()) {
+      const values = enumDef.values.map(toSingleQuotedLiteral).join(', ');
+      code += `export const ${enumVariableName(enumDef)} = pgEnum('${toSnakeCase(enumDef.name)}', [${values}]);\n`;
     }
-    code += '\n';
     return code;
+  }
+
+  /**
+   * The enum a field uses by enumName, declared on any model
+   */
+  private findFieldEnum(field: FieldDefinition): EnumDefinition | undefined {
+    return field.type === 'enum' && field.enumName ? this.enums.get(field.enumName) : undefined;
   }
 
   /**
@@ -474,6 +496,12 @@ export class DrizzleSchemaGenerator {
     // Add modifiers
     const modifiers: string[] = [];
 
+    // .array() wraps the base builder in a new one that keeps none of the base's modifiers,
+    // so it comes first: text('x').notNull().array() would be a nullable column
+    if (field.array) {
+      modifiers.push('.array()');
+    }
+
     if (field.primaryKey) {
       modifiers.push('.primaryKey()');
     }
@@ -489,18 +517,9 @@ export class DrizzleSchemaGenerator {
       modifiers.push('.notNull()');
     }
 
-    if (field.defaultValue !== undefined) {
-      if (
-        typeof field.defaultValue === 'string' &&
-        field.defaultValue.includes('()')
-      ) {
-        // SQL function
-        modifiers.push(`.default(sql\`${field.defaultValue}\`)`);
-      } else if (typeof field.defaultValue === 'string') {
-        modifiers.push(`.default('${field.defaultValue}')`);
-      } else {
-        modifiers.push(`.default(${field.defaultValue})`);
-      }
+    const defaultModifier = this.generateDefaultModifier(field);
+    if (defaultModifier) {
+      modifiers.push(defaultModifier);
     }
 
     if (field.references) {
@@ -517,13 +536,32 @@ export class DrizzleSchemaGenerator {
       }
     }
 
-    if (field.array) {
-      modifiers.push('.array()');
-    }
-
     definition += modifiers.join('') + comment;
 
     return definition;
+  }
+
+  /**
+   * Generate the .default() modifier, or null when the field has no default.
+   *
+   * An SQL default goes through sql``. A value is written as a literal that drizzle serializes:
+   * an array column takes a JS array, a json/jsonb column any JSON value ('[]' would store the
+   * JSON string "[]", not an empty array).
+   */
+  private generateDefaultModifier(field: FieldDefinition): string | null {
+    const defaultSql = getDefaultSql(field);
+    if (defaultSql !== null) {
+      return `.default(sql\`${escapeTemplateLiteral(defaultSql)}\`)`;
+    }
+
+    const value = field.defaultValue;
+    if (value === undefined) {
+      return null;
+    }
+    if (typeof value === 'string') {
+      return `.default(${toSingleQuotedLiteral(value)})`;
+    }
+    return `.default(${JSON.stringify(value)})`;
   }
 
   /**
@@ -532,11 +570,11 @@ export class DrizzleSchemaGenerator {
   private generateEnumField(field: FieldDefinition, model: ModelDefinition): string {
     const fieldName = toSnakeCase(field.name);
 
-    // Check if using named enum from model.enums
+    // Check if using a named enum (declared on any model)
     if (field.enumName) {
-      const enumDef = model.enums?.find((e) => e.name === field.enumName);
+      const enumDef = this.findFieldEnum(field);
       if (!enumDef) {
-        throw new Error(`Enum '${field.enumName}' not found in model '${model.name}'`);
+        throw new Error(`Enum '${field.enumName}' used by '${model.name}.${field.name}' is not declared on any model`);
       }
 
       // Check if using bitwise storage
@@ -544,9 +582,8 @@ export class DrizzleSchemaGenerator {
         // Store as integer for bitwise operations
         return `integer('${fieldName}')`;
       } else {
-        // Use pgEnum
-        const enumName = `${enumDef.name.toLowerCase()}Enum`;
-        return `${enumName}('${fieldName}')`;
+        // Use the shared pgEnum
+        return `${enumVariableName(enumDef)}('${fieldName}')`;
       }
     }
 
@@ -1052,6 +1089,10 @@ export class DrizzleSchemaGenerator {
    */
   private generateIndexFile(): string {
     let code = '// Export all schemas and relations\n';
+
+    if (this.enums.size > 0) {
+      code += `export * from './enums.ts';\n`;
+    }
 
     // Export model schemas
     for (const model of this.models) {

@@ -68,10 +68,10 @@ export async function startServer(config: ServerConfig = {}): Promise<ServerHand
         beforeCreate: (
           rawInput: unknown,
           _context?: DomainHookContext<ExampleEnv['Variables']>,
-        ): Promise<unknown> => {
+        ): Promise<Record<string, unknown>> => {
           console.log('Employee.beforeCreate - outside transaction, before validation');
           // Can transform input, do auth checks, or throw to prevent operation
-          return Promise.resolve(rawInput);
+          return Promise.resolve(rawInput as Record<string, unknown>);
         },
 
         // CREATE hooks with full signatures
@@ -110,9 +110,9 @@ export async function startServer(config: ServerConfig = {}): Promise<ServerHand
           _id: string,
           rawInput: unknown,
           _context?: DomainHookContext<ExampleEnv['Variables']>,
-        ): Promise<unknown> => {
+        ): Promise<Record<string, unknown>> => {
           console.log('Employee.beforeUpdate - outside transaction, before validation');
-          return Promise.resolve(rawInput);
+          return Promise.resolve(rawInput as Record<string, unknown>);
         },
 
         preUpdate: (

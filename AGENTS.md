@@ -16,7 +16,8 @@ cog/
 │   ├── parser/model-parser.ts              # JSON model validation & parsing
 │   ├── utils/
 │   │   ├── string.utils.ts                 # String utilities (capitalize, toSnakeCase, toCamelCase)
-│   │   ├── field.utils.ts                  # Field normalization, soft-delete column, PostGIS field detection
+│   │   ├── field.utils.ts                  # Field normalization, soft-delete column, PostGIS fields, SQL defaults
+│   │   ├── enum.utils.ts                   # Global enum registry (collectEnums), declaration agreement
 │   │   └── dependency.utils.ts             # Dependency contract of the generated code (scan + report)
 │   └── generators/
 │       ├── drizzle-schema.generator.ts     # Drizzle ORM schemas
@@ -89,6 +90,7 @@ generated/
 │   └── bootstrap.ts            # PostGIS extension (PostgreSQL only)
 ├── schema/
 │   ├── [model].schema.ts       # Drizzle tables + Zod schemas
+│   ├── enums.ts                # Every pgEnum once, imported by the schemas that use it
 │   ├── spatial-utils.ts        # GeoJSON <-> WKT conversion
 │   └── relations.ts            # Drizzle relationships
 ├── domain/
@@ -238,16 +240,24 @@ definition.
   extension statement. Declaring a spatial field is then a configuration error: `generateFromModels` throws and names
   the offending fields instead of downgrading the columns
 - Numeric defaults limited to `Number.MAX_SAFE_INTEGER` (2^53-1)
+- Enums are global database types: `collectEnums` (`src/utils/enum.utils.ts`) gathers the `enums` of all models by name
+  into the generated `schema/enums.ts`, each once; the model schemas import the `pgEnum`s their fields use and
+  `schema/index.ts` re-exports the module. A field may use an enum declared on any model. Declarations of one name must
+  agree (`enumsAgree`: same values in the same order, same `useBitwise`) - the parser reports a conflict and an unknown
+  `enumName` as errors. Each model used to emit its own `pgEnum`, so two models with the same enum exported the same
+  name twice through `export *` and the schema index did not compile
 
 ## Field Properties
 
-| Property     | Values                                   | Description                        |
-| ------------ | ---------------------------------------- | ---------------------------------- |
-| `expose`     | `default`, `hidden`, `create`            | Controls response visibility       |
-| `accept`     | `default`, `create`, `never`             | Controls input acceptance          |
-| `references` | `{ model, field, onDelete?, onUpdate? }` | Foreign key definition             |
-| `maxLength`  | `number`                                 | String/text max length (see below) |
-| `minLength`  | `number`                                 | String/text min length (Zod check) |
+| Property       | Values                                   | Description                        |
+| -------------- | ---------------------------------------- | ---------------------------------- |
+| `expose`       | `default`, `hidden`, `create`            | Controls response visibility       |
+| `accept`       | `default`, `create`, `never`             | Controls input acceptance          |
+| `references`   | `{ model, field, onDelete?, onUpdate? }` | Foreign key definition             |
+| `maxLength`    | `number`                                 | String/text max length (see below) |
+| `minLength`    | `number`                                 | String/text min length (Zod check) |
+| `defaultValue` | JSON value                               | Value default (see below)          |
+| `defaultSql`   | `string`                                 | SQL expression default             |
 
 **`expose`**: `hidden` = never visible, `create` = visible only in POST response **`accept`**: `create` = immutable
 after creation, `never` = server-managed (use hook or defaultValue)
@@ -256,6 +266,21 @@ after creation, `never` = server-managed (use hook or defaultValue)
 both bounds are enforced at the API layer on create and update. A violation throws a `ZodError` → **HTTP 400**.
 `maxLength` additionally sets the `varchar` column length for `string` fields (`text` columns stay unbounded). Not
 applied to array fields (`"array": true`), where a length check would constrain the array, not its elements.
+
+**Column modifiers**: `.array()` is emitted right after the base type, before `.primaryKey()`, `.unique()`,
+`.notNull()`, `.default()` and `.references()`. drizzle's `PgArrayBuilder` wraps the base builder and keeps none of its
+modifiers: `text('x').notNull().array()` was a nullable column (and so was its Zod schema), with its default and foreign
+key lost.
+
+**Defaults** (`generateDefaultModifier`, `getDefaultSql` in `src/utils/field.utils.ts`): `defaultSql` is an SQL
+expression emitted as
+`sql\`...\``; a`defaultValue`string containing`()`is the older convention for the same and
+still read as SQL. Any other`defaultValue`is a value emitted as a literal that drizzle serializes - strings single
+quoted and escaped, everything else via`JSON.stringify`. So an array field takes`[]`(the parser refuses a string such
+as`'{}'`, which drizzle would pass as a string), a`json`/`jsonb`field any JSON value (`[]`becomes`'[]'::jsonb`;`'[]'`would be the JSON string), and arrays/objects are refused elsewhere. A function call as a json/jsonb default
+(`jsonb_build_array()`) gets a parser warning: drizzle-kit reads json defaults back with`JSON.parse`during push and
+fails on every later change. Parser warnings are printed (`console.warn`)
+and do not stop generation.
 
 ## Relationships
 
@@ -296,12 +321,18 @@ Before-hook (outside tx) → Zod validation → Begin TX → Pre-hook → Zod �
 
 | Hook           | Signature                                                | When                |
 | -------------- | -------------------------------------------------------- | ------------------- |
-| `beforeCreate` | `(rawInput, ctx?) => Promise<unknown>`                   | Before validation   |
+| `beforeCreate` | `(rawInput, ctx?) => Promise<Record<string, unknown>>`   | Before validation   |
 | `preCreate`    | `(input, rawInput, tx, ctx?) => Promise<input>`          | Before DB operation |
 | `postCreate`   | `(input, result, rawInput, tx, ctx?) => Promise<result>` | After DB (in tx)    |
 | `afterCreate`  | `(result, rawInput, ctx?) => Promise<void>`              | After commit        |
 
 Same pattern for `Update`, `Delete`, `FindById`, `FindMany`, and junction operations (`AddJunction`, `RemoveJunction`).
+
+- `beforeCreate`/`beforeUpdate` receive the input after `stripUnacceptedFields`, before Zod - so they also see keys that
+  are no column, which Zod drops afterwards. Their return value is the input to validate; the return type is
+  `Promise<Record<string, unknown>>` (it was `Promise<unknown>`, which let a hook that forgot to return compile and fail
+  validation on `undefined`).
+- The `rawInput` of `pre*`/`post*`/`after*` is the caller's original input, not the `before*` output.
 
 **Context**: the Hono context variables (`c.var`) the app's middleware sets with `c.set()`; the CRUD and many-to-many
 handlers pass them to every domain call, typed through the `DomainEnvVars` generic.
@@ -443,7 +474,11 @@ for a soft-deleted parent) and throw to reject the write.
 
 ## Filtering
 
-Filters passed via `where` query parameter as base64-encoded JSON.
+Filters passed via `where` query parameter as base64-encoded UTF-8 JSON. `parseWhereParam` accepts standard base64 and
+base64url (padding optional; a space is read back as the `+` a query string decoded) and decodes the bytes with a fatal
+`TextDecoder` - invalid UTF-8 is a 400. `encodeFilter` emits unpadded base64url. It used to be plain `atob`/`btoa`:
+`atob` returns latin-1, so every non-ASCII value was garbled and silently matched nothing, and `btoa` throws on
+characters outside latin-1 (`ő`, `ű`). A client that sent a latin-1 `btoa` of `á`/`é` gets no match now.
 
 ```json
 { "field": "status", "op": "eq", "value": "active" }

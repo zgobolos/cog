@@ -4,17 +4,20 @@
  * Instead of generating a massive static JSON spec, this generates
  * compact model metadata that can build the spec dynamically at runtime.
  */
-import { FieldDefinition, ModelDefinition, RelationshipDefinition } from '../types/model.types.ts';
+import { EnumDefinition, FieldDefinition, ModelDefinition, RelationshipDefinition } from '../types/model.types.ts';
 import { normalizeAccept, normalizeExpose } from '../utils/field.utils.ts';
+import { collectEnums } from '../utils/enum.utils.ts';
 
 /**
  * Generates OpenAPI metadata file for runtime spec building
  */
 export class OpenAPIMetadataGenerator {
   private models: ModelDefinition[];
+  private enums: Map<string, EnumDefinition>;
 
   constructor(models: ModelDefinition[]) {
     this.models = models;
+    this.enums = collectEnums(models);
   }
 
   /**
@@ -105,7 +108,7 @@ export const getModelNames = (): string[] =>
       name: model.name,
       nameLower: model.name.toLowerCase(),
       description: model.description,
-      fields: model.fields.map((field) => this.generateFieldMeta(field, model)),
+      fields: model.fields.map((field) => this.generateFieldMeta(field)),
       relationships: (model.relationships || []).map((rel) => this.generateRelationshipMeta(rel)),
       endpoints: {
         create: model.endpoints?.create !== false,
@@ -121,10 +124,10 @@ export const getModelNames = (): string[] =>
   /**
    * Generate metadata for a single field
    */
-  private generateFieldMeta(field: FieldDefinition, model: ModelDefinition): Record<string, unknown> {
+  private generateFieldMeta(field: FieldDefinition): Record<string, unknown> {
     const exposeConfig = normalizeExpose(field.expose);
     const acceptConfig = normalizeAccept(field.accept);
-    const typeInfo = this.getOpenAPIType(field, model);
+    const typeInfo = this.getOpenAPIType(field);
 
     const meta: Record<string, unknown> = {
       name: field.name,
@@ -181,15 +184,14 @@ export const getModelNames = (): string[] =>
    */
   private getOpenAPIType(
     field: FieldDefinition,
-    model: ModelDefinition,
   ): { type: string; format?: string; enum?: string[] } {
     // Handle enum fields
     if (field.type === 'enum') {
       let enumValues: string[] = [];
       let isBitwise = false;
 
-      if (field.enumName && model.enums) {
-        const enumDef = model.enums.find((e) => e.name === field.enumName);
+      if (field.enumName) {
+        const enumDef = this.enums.get(field.enumName);
         if (enumDef) {
           enumValues = enumDef.values;
           isBitwise = enumDef.useBitwise === true;

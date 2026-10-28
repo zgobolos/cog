@@ -369,7 +369,8 @@ longer than 63 bytes, a spatial field while PostGIS is off.
 | `required`           | all              | `NOT NULL`, and required in the create input                                                   |
 | `unique`             | all              | unique constraint; a partial unique index on a soft-delete model                               |
 | `index`              | all              | an index on the column                                                                         |
-| `defaultValue`       | all              | see [Default values](#default-values)                                                          |
+| `defaultValue`       | all              | a value default — see [Default values](#default-values)                                        |
+| `defaultSql`         | all              | an SQL expression default — see [Default values](#default-values)                              |
 | `array`              | all              | an array of `type`                                                                             |
 | `references`         | all              | foreign key `{ "model", "field", "onDelete", "onUpdate" }` — see [Foreign keys](#foreign-keys) |
 | `expose`             | all              | visibility in responses — see [Field exposure and acceptance](#field-exposure-and-acceptance)  |
@@ -378,7 +379,7 @@ longer than 63 bytes, a spatial field while PostGIS is off.
 | `maxLength`          | `string`, `text` | maximum length, checked on create and update; also the `varchar` length of a `string` column   |
 | `minLength`          | `string`, `text` | minimum length, checked on create and update                                                   |
 | `precision`, `scale` | `decimal`        | `numeric(precision, scale)`                                                                    |
-| `enumName`           | `enum`           | the name of an enum from the model's `enums`                                                   |
+| `enumName`           | `enum`           | the name of an enum declared in the `enums` of any model                                       |
 | `srid`               | spatial          | spatial reference id, e.g. `4326`                                                              |
 | `geometryType`       | `geometry`       | geometry type of a generic `geometry` column, e.g. `"POINT"`                                   |
 
@@ -406,14 +407,24 @@ spatial field makes generation fail.
 ### Default values
 
 ```json
-{ "name": "id", "type": "uuid", "primaryKey": true, "defaultValue": "gen_random_uuid()" }
+{ "name": "id", "type": "uuid", "primaryKey": true, "defaultSql": "gen_random_uuid()" }
 { "name": "status", "type": "string", "maxLength": 20, "defaultValue": "draft" }
 { "name": "stock", "type": "integer", "defaultValue": 0 }
 { "name": "isActive", "type": "boolean", "defaultValue": true }
+{ "name": "emails", "type": "text", "array": true, "required": true, "defaultValue": [] }
+{ "name": "settings", "type": "jsonb", "defaultValue": { "theme": "light" } }
 ```
 
-A string containing `()` is a SQL expression, any other string a literal. Numeric defaults are limited to
-`Number.MAX_SAFE_INTEGER` (2^53−1).
+`defaultValue` is a value, written as JSON: drizzle serializes it for the column. An array field takes an array (`[]`,
+not Postgres' `'{}'` literal), and a `json`/`jsonb` field any JSON value — `[]` there is an empty array, while the
+string `"[]"` would be stored as a JSON string. Arrays and objects are refused on any other field. `defaultSql` is an
+SQL expression, used as written; a field has one or the other. A `defaultValue` string containing `()` is also read as
+SQL — the convention before `defaultSql`, still supported. Numeric defaults are limited to `Number.MAX_SAFE_INTEGER`
+(2^53−1).
+
+Avoid a function call as the default of a `json`/`jsonb` field (`jsonb_build_array()`): drizzle-kit reads such a default
+back from the database with `JSON.parse`, and every later `drizzle:push` fails on it. Generation warns about it; a JSON
+`defaultValue` is emitted as a literal cast (`'[]'::jsonb`), which drizzle-kit reads back.
 
 ### Enums
 
@@ -431,10 +442,12 @@ Define the enum on the model and point the field at it:
 }
 ```
 
-This creates a database enum type (`book_format`), and the API accepts only the listed values. `"useBitwise": true` on
-the enum stores the field as a plain `integer` instead, for flag sets combined with bitwise operators; the application
-encodes those numbers itself. Inline `enumValues` on a field are not supported — generation stops and asks for a
-model-level enum.
+This creates a database enum type (`book_format`), and the API accepts only the listed values. An enum is a database
+type, so its name is global: every enum is declared once in the generated `schema/enums.ts`, a field may use an enum
+declared on any model, and two models declaring the same enum must declare it identically — same values in the same
+order — or generation stops. `"useBitwise": true` on the enum stores the field as a plain `integer` instead, for flag
+sets combined with bitwise operators; the application encodes those numbers itself. Inline `enumValues` on a field are
+not supported — generation stops and asks for a model-level enum.
 
 ### Relationships
 
@@ -589,6 +602,7 @@ validation — here the required `createdBy` of an `Account` model, taken from t
 const accountHooks: DomainHooks<Account, NewAccount, Partial<NewAccount>, AppVariables> = {
   beforeCreate: (rawInput, context) =>
     Promise.resolve({ ...(rawInput as Record<string, unknown>), createdBy: context?.userId }),
+  // beforeCreate returns the input to validate: a hook that only changes rawInput and returns nothing does not compile
 };
 ```
 
@@ -895,6 +909,12 @@ Every hook returns a promise. `context` is the request context — see
 - `before*` hooks get no transaction handle and see the raw input before validation: authorization checks, input
   transformation, server-managed values. Through the REST API the transaction is already open when they run, so keep
   them quick.
+- `beforeCreate` and `beforeUpdate` see the input after the fields the model does not accept were removed, so they also
+  see keys that are no column (a `token` to verify, say); validation drops those afterwards. What they return is the
+  input that gets validated — the return type is `Promise<Record<string, unknown>>`, so a hook that forgets to return
+  does not compile.
+- The `rawInput` of the `pre*`, `post*` and `after*` hooks is the caller's input as it arrived, not the output of the
+  `before*` hook.
 - `pre*` and `post*` hooks run in the transaction and receive `tx` — pass it to every domain call they make, so the work
   commits or rolls back together.
 - `after*` hooks start once the transaction has committed and are not awaited; a failure is logged, never thrown.
@@ -1063,15 +1083,19 @@ A filter is a condition, or an `and`/`or` group of conditions and groups:
 `in`, `nin`, `contains` and `overlaps` take an array; `like` and `ilike` take a SQL pattern with `%` and `_`;
 `isNull: true` matches `NULL` and `isNull: false` everything else; dates compare as epoch milliseconds.
 
-The `where` parameter is the filter's JSON, base64-encoded, then URL-encoded:
+The `where` parameter is the filter's JSON as UTF-8, base64-encoded. The server accepts standard base64 (URL-encode it:
+`+`, `/` and `=` have a meaning in a query string) and base64url (`-` and `_`, padding optional), which needs no
+escaping. `encodeFilter` produces base64url:
 
 ```typescript
 import { andFilters, encodeFilter, eqFilter, ilikeFilter } from './generated/index.ts';
 
-const where = encodeFilter(andFilters(eqFilter('format', 'ebook'), ilikeFilter('title', '%season%')));
-await fetch(`/api/book?where=${encodeURIComponent(where)}`);
-// the same by hand: encodeURIComponent(btoa(JSON.stringify(filter)))
+const where = encodeFilter(andFilters(eqFilter('format', 'ebook'), ilikeFilter('title', 'Árvíz%')));
+await fetch(`/api/book?where=${where}`);
 ```
+
+Encode the UTF-8 bytes, not the string: `btoa(JSON.stringify(filter))` works only for latin-1 text and throws on `ő` or
+`ű`, and the server decodes the payload as UTF-8, so a latin-1 encoding of `á` or `é` no longer matches.
 
 `eqFilter`, `inFilter`, `likeFilter`, `ilikeFilter`, `rangeFilter`, `andFilters` and `orFilters` build filters. A
 malformed filter, a hidden or create-only field, or an operator the field type does not support answers **400**.

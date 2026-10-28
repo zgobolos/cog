@@ -213,9 +213,25 @@ export function getOperatorsForType(type: string, isArray: boolean): FilterOpera
 // ============================================
 
 /**
+ * Decode base64 or base64url (padding optional) to UTF-8 text.
+ *
+ * atob() alone returns one character per byte (latin-1), which garbles every non-ASCII
+ * character. A space is never base64: it is a '+' the query string decoded, so it maps back.
+ */
+const decodeBase64Utf8 = (encoded: string): string => {
+  const base64 = encoded.replace(/ /g, '+').replace(/-/g, '+').replace(/_/g, '/');
+  const bytes = Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    throw new Error('malformed UTF-8 in base64 payload');
+  }
+};
+
+/**
  * Parse base64-encoded where parameter to filter object
  *
- * @param whereParam - Base64-encoded JSON string from query parameter
+ * @param whereParam - Base64 or base64url encoded UTF-8 JSON string from query parameter
  * @returns Parsed WhereFilter object or undefined if invalid/empty
  * @throws Error if the filter is malformed (for 400 response)
  */
@@ -225,8 +241,8 @@ export function parseWhereParam(whereParam: string | undefined): WhereFilter | u
   }
 
   try {
-    // Decode base64
-    const json = atob(whereParam);
+    // Decode base64 / base64url as UTF-8
+    const json = decodeBase64Utf8(whereParam);
 
     // Parse JSON
     const parsed = JSON.parse(json);
@@ -527,13 +543,18 @@ export function stripUnacceptedFields<T extends Record<string, unknown>>(
 // ============================================
 
 /**
- * Encode a filter object to base64 for use in URL query parameter
+ * Encode a filter object for use in URL query parameter
+ *
+ * The JSON is encoded as UTF-8 and then as unpadded base64url, so it needs no URL escaping
+ * and carries any character (btoa() alone throws on everything outside latin-1).
  *
  * @param filter - The filter object to encode
- * @returns Base64-encoded JSON string
+ * @returns Base64url-encoded UTF-8 JSON string
  */
 export function encodeFilter(filter: WhereFilter): string {
-  return btoa(JSON.stringify(filter));
+  const bytes = new TextEncoder().encode(JSON.stringify(filter));
+  const binary = Array.from(bytes, (byte) => String.fromCharCode(byte)).join('');
+  return btoa(binary).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');
 }
 
 /**

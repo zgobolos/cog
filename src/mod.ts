@@ -60,9 +60,12 @@ export async function generateFromModels(
 
   if (errors.length > 0) {
     const hasErrors = errors.some((e) => e.severity === 'error');
-    console.log(errors.filter((e) => e.severity === 'error'));
-
+    const warnings = errors.filter((e) => e.severity === 'warning');
+    if (warnings.length > 0) {
+      console.warn(warnings);
+    }
     if (hasErrors) {
+      console.log(errors.filter((e) => e.severity === 'error'));
       throw new Error('Generation aborted due to validation errors');
     }
   }

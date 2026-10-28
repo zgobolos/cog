@@ -19,6 +19,7 @@ import {
   type Assignment,
   type Department,
   type Employee,
+  encodeFilter,
   type ExposureTestEntity,
   exposuretestentityDomain,
   exposuretestentityTable,
@@ -139,10 +140,6 @@ async function REQUEST(
     }
     return { status: response.status, ok: false, error };
   }
-}
-
-function encodeFilter(filter: unknown): string {
-  return btoa(JSON.stringify(filter));
 }
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -1627,6 +1624,74 @@ async function runTests(): Promise<void> {
   const missingParent = await REQUEST('GET', `/api/employee/${crypto.randomUUID()}/skillList`);
   assertEquals(missingParent.status, 404, 'a missing parent is a 404, not an empty list');
   logSuccess('✓ The many-to-many list reads through the parent and target domains');
+
+  // ========================================
+  // 25. ARRAY COLUMNS, VALUE DEFAULTS, SHARED ENUMS AND UTF-8 FILTERS
+  // ========================================
+  logSection('25. Testing Array Columns, Value Defaults, Shared Enums and UTF-8 Filters');
+
+  // .array() used to come after .notNull()/.default(), and drizzle's array builder keeps none of
+  // the base's modifiers: a required array column was nullable and lost its default.
+  logStep('25.1 A required array column is NOT NULL; array and jsonb defaults are values');
+  const demoColumns = await rawSql`
+    SELECT column_name, is_nullable FROM information_schema.columns
+    WHERE table_name = 'data_type_demo' AND column_name IN ('required_tags_array', 'jsonb_list_field')
+  `;
+  assertEquals(demoColumns.length, 2, 'both columns exist');
+  for (const column of demoColumns) {
+    assertEquals(column.is_nullable, 'NO', `${column.column_name} must be NOT NULL`);
+  }
+  const demo = await POST('/api/datatypedemo', {}) as Record<string, unknown>;
+  assertEquals(demo.requiredTagsArray, [], 'the array default is an empty array');
+  assertEquals(demo.jsonbListField, [], 'the jsonb default is an empty JSON array, not the string "[]"');
+  assertEquals(demo.quotedTextField, `it's "quoted"`, 'a string default with quotes survives code generation');
+  const nullArray = await REQUEST('POST', '/api/datatypedemo', { requiredTagsArray: null });
+  assertEquals(nullArray.status, 400, 'null for a required array column is refused');
+  await DELETE(`/api/datatypedemo/${demo.id}`);
+  logSuccess('✓ Array modifiers hold, value defaults are stored as values');
+
+  // Priority is declared by DataTypeDemo and AdvancedDemo, Status only by DataTypeDemo; both live in
+  // schema/enums.ts once, and AdvancedDemo uses an enum it does not declare.
+  logStep('25.2 An enum declared by two models, and one used by a model that does not declare it');
+  const enumDemo = await POST('/api/advanceddemo', {
+    name: 'Enum Probe',
+    optionalField1: 'first',
+    optionalField2: 2,
+    priority: 'high',
+    status: 'active',
+  }) as Record<string, unknown>;
+  assertEquals(enumDemo.priority, 'high', 'the shared Priority enum is accepted');
+  assertEquals(enumDemo.status, 'active', "DataTypeDemo's Status enum is usable from AdvancedDemo");
+  const badEnum = await REQUEST('POST', '/api/advanceddemo', {
+    name: 'Enum Probe',
+    optionalField1: 'first',
+    optionalField2: 2,
+    status: 'nope',
+  });
+  assertEquals(badEnum.status, 400, 'a value outside the enum is refused');
+  await DELETE(`/api/advanceddemo/${enumDemo.id}`);
+  logSuccess('✓ Shared enums work across models');
+
+  // The where parameter was decoded with atob(), which yields latin-1: every non-ASCII character was
+  // garbled and the filter silently matched nothing.
+  logStep('25.3 Filters with non-ASCII values, in base64url and in standard base64');
+  const accentedName = 'Árvíztűrő tükörfúrógép';
+  const accentedSkill = await POST('/api/skill', { name: accentedName }) as Skill;
+  createdIds.skills.push(accentedSkill.id);
+  const byAccentedName = { field: 'name', op: 'eq', value: accentedName } as const;
+  const viaBase64url = await GET<{ data: Skill[] }>(`/api/skill?where=${encodeFilter(byAccentedName)}`);
+  assertEquals(viaBase64url.data.map((skill) => skill.id), [accentedSkill.id], 'base64url (encodeFilter) matches');
+  const utf8Bytes = new TextEncoder().encode(JSON.stringify(byAccentedName));
+  const standardBase64 = btoa(Array.from(utf8Bytes, (byte) => String.fromCharCode(byte)).join(''));
+  const viaBase64 = await GET<{ data: Skill[] }>(`/api/skill?where=${encodeURIComponent(standardBase64)}`);
+  assertEquals(viaBase64.data.map((skill) => skill.id), [accentedSkill.id], 'padded standard base64 matches');
+  const byPrefix = await GET<{ data: Skill[] }>(
+    `/api/skill?where=${encodeFilter({ field: 'name', op: 'like', value: 'Árvíz%' })}`,
+  );
+  assertEquals(byPrefix.data.map((skill) => skill.id), [accentedSkill.id], 'a like pattern with accents matches');
+  const notUtf8 = await REQUEST('GET', `/api/skill?where=${encodeURIComponent(btoa('\xff\xfe'))}`);
+  assertEquals(notUtf8.status, 400, 'bytes that are not UTF-8 are a 400');
+  logSuccess('✓ Filters carry UTF-8 values');
 
   // ========================================
   // SUCCESS

@@ -7,6 +7,8 @@ import {
   ValidationError,
 } from '../types/model.types.ts';
 import { isPostGISType } from '../constants.ts';
+import { getDefaultSql } from '../utils/field.utils.ts';
+import { collectEnums } from '../utils/enum.utils.ts';
 import {
   checkConstraintName,
   columnName,
@@ -47,8 +49,9 @@ export class ModelParser {
         }
       }
 
-      // Validate relationships after all models are loaded
+      // Validate relationships and enum usage after all models are loaded
       this.validateRelationships();
+      this.validateEnumUsage();
 
       return {
         models: Array.from(this.models.values()),
@@ -367,6 +370,10 @@ export class ModelParser {
         }
       }
 
+      if (!this.validateDefault(field as unknown as FieldDefinition, modelName)) {
+        return null;
+      }
+
       // Validate PostGIS fields
       if (isPostGISType(field.type)) {
         if (field.srid && (typeof field.srid !== 'number')) {
@@ -455,6 +462,58 @@ export class ModelParser {
   }
 
   /**
+   * Validate a field's defaultValue / defaultSql. Returns false on an error.
+   *
+   * drizzle serializes a value default, so its shape has to match the column: an array column
+   * needs an array ('{}' is not one), and only array and json/jsonb columns take arrays or objects.
+   */
+  private validateDefault(field: FieldDefinition, modelName: string): boolean {
+    const error = (message: string): boolean => {
+      this.errors.push({ model: modelName, field: field.name, message, severity: 'error' });
+      return false;
+    };
+
+    if (field.defaultSql !== undefined) {
+      if (typeof field.defaultSql !== 'string' || field.defaultSql.trim() === '') {
+        return error(`Field '${field.name}' has invalid defaultSql: it must be a non-empty SQL expression`);
+      }
+      if (field.defaultValue !== undefined) {
+        return error(`Field '${field.name}' cannot have both 'defaultValue' and 'defaultSql'`);
+      }
+    }
+
+    const value = field.defaultValue;
+    const isJsonType = field.type === 'json' || field.type === 'jsonb';
+    if (
+      field.array && value !== undefined && value !== null && !Array.isArray(value) && getDefaultSql(field) === null
+    ) {
+      return error(
+        `Array field '${field.name}' needs an array defaultValue (e.g. []) or a 'defaultSql', got ${
+          JSON.stringify(value)
+        }`,
+      );
+    }
+    if (typeof value === 'object' && value !== null && !field.array && !isJsonType) {
+      return error(`Field '${field.name}' of type '${field.type}' cannot have an array or object defaultValue`);
+    }
+
+    // drizzle-kit reads a json/jsonb default back from the database with JSON.parse, so a function
+    // call there makes every later push fail. A JSON defaultValue is emitted as a literal cast.
+    const defaultSql = getDefaultSql(field);
+    if (isJsonType && !field.array && defaultSql !== null && !/^'.*'::jsonb?$/s.test(defaultSql.trim())) {
+      this.errors.push({
+        model: modelName,
+        field: field.name,
+        message: `Field '${field.name}' has the SQL default '${defaultSql}': drizzle-kit push cannot read it back ` +
+          `from the database and fails on every later change. Use a JSON defaultValue (e.g. [] or {}) instead.`,
+        severity: 'warning',
+      });
+    }
+
+    return true;
+  }
+
+  /**
    * Validate relationships after all models are loaded
    */
   private validateRelationships(): void {
@@ -496,6 +555,34 @@ export class ModelParser {
               severity: 'warning',
             });
           }
+        }
+      }
+    }
+  }
+
+  /**
+   * Validate enums across models, after all models are loaded: an enum is a database type, so
+   * every declaration of a name must agree, and a field may use an enum declared on any model
+   */
+  private validateEnumUsage(): void {
+    const declared = collectEnums(Array.from(this.models.values()), (model, enumDef) => {
+      this.errors.push({
+        model: model.name,
+        message: `Enum '${enumDef.name}' is declared with different values or storage than in another model. ` +
+          `Declarations of the same enum must be identical, or use different names.`,
+        severity: 'error',
+      });
+    });
+
+    for (const model of this.models.values()) {
+      for (const field of model.fields) {
+        if (field.type === 'enum' && field.enumName && !declared.has(field.enumName)) {
+          this.errors.push({
+            model: model.name,
+            field: field.name,
+            message: `Enum field '${field.name}' uses enum '${field.enumName}', which no model declares`,
+            severity: 'error',
+          });
         }
       }
     }

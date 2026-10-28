@@ -2,6 +2,12 @@
   "name": "AdvancedDemo",
   "tableName": "advanced_demo",
   "schema": "analytics",
+  "enums": [
+    {
+      "name": "Priority",
+      "values": ["low", "medium", "high", "urgent"]
+    }
+  ],
   "fields": [
     {
       "name": "id",
@@ -67,6 +73,16 @@
       "name": "tags",
       "type": "string",
       "array": true
+    },
+    {
+      "name": "priority",
+      "type": "enum",
+      "enumName": "Priority"
+    },
+    {
+      "name": "status",
+      "type": "enum",
+      "enumName": "Status"
     }
   ],
   "relationships": [
