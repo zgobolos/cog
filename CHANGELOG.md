@@ -2,6 +2,14 @@
 
 Releases are git tags (`2.4.0`, no `v` prefix). Versions before 2.3.0 are described in their commit messages.
 
+## 2.4.1
+
+### Fixed
+
+- Integration section 26 failed at random: the `afterUpdate` of an earlier update, started after its commit and not
+  awaited, could land among the hooks of the next one. The test waits for it now. The generated code is the same as in
+  2.4.0.
+
 ## 2.4.0
 
 ### Added

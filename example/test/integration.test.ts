@@ -1742,6 +1742,9 @@ async function runTests(): Promise<void> {
   assertEquals(untrustedUpdated.createOnlyField, null, 'the create-only field is unchanged');
 
   logStep('26.3 A trusted update writes never and create-only fields, keeps the id and runs every hook');
+  // 26.2's afterUpdate starts after its COMMIT, not awaited: let it land before the list is reset,
+  // or it shows up among 26.3's hooks
+  await waitUntil(() => trustedHooks.includes('afterUpdate'), 'afterUpdate of the update without options');
   trustedHooks.length = 0;
   const trustedUpdated = await withTransaction((tx) =>
     trustedDomain.update(
