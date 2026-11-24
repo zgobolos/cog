@@ -609,6 +609,20 @@ const accountHooks: DomainHooks<Account, NewAccount, Partial<NewAccount>, AppVar
 Related objects loaded with `include` follow their own model's rules. Server-side callers can get every field back with
 the domain option `skipSanitization: true`.
 
+**Trusted writes.** `accept` guards input from outside — a REST body, a tool call's arguments. Server code that writes
+its own value into such a field (closing a record with an `endDate`, setting an `archivedAt`) passes
+`{ trusted: true }`, so the write goes through the domain and every hook runs, instead of a direct Drizzle write that
+skips them:
+
+```typescript
+await withTransaction((tx) => ownershipDomain.update(id, { endDate: Date.now() }, tx, { trusted: true }));
+```
+
+A trusted `create` or `update` writes the `"never"` fields, and an update the `"create"` fields too. The columns COG
+manages stay out of reach even then: `createdAt`, `updatedAt`, the soft-delete column and, on update, the primary key.
+Validation and the hook order are unchanged. The generated REST API never sets the option. Never build it from request
+input, and never pass it while forwarding a caller's input — only for values the server computed itself.
+
 ### String length validation
 
 `minLength` and `maxLength` on `string` and `text` fields are Zod checks on both create and update; a value outside the
@@ -757,15 +771,16 @@ const withBooks = await authorDomain.findById(author.id, undefined, { include: [
 
 ### Query options
 
-| Option             | Methods                | Meaning                                                       |
-| ------------------ | ---------------------- | ------------------------------------------------------------- |
-| `where`            | `findMany`             | a [filter](#filtering) object, or a drizzle `SQL` condition   |
-| `limit`, `offset`  | `findMany`             | pagination; no limit by default (the REST API defaults to 10) |
-| `orderBy`          | `findMany`             | a field name (camelCase); an unknown field is ignored         |
-| `orderDirection`   | `findMany`             | `'asc'` (default) or `'desc'`                                 |
-| `include`          | `findById`, `findMany` | relation names to load                                        |
-| `skipSanitization` | all                    | return hidden and create-only fields too                      |
-| `withSoftDeleted`  | `findById`, `findMany` | include soft-deleted rows                                     |
+| Option             | Methods                | Meaning                                                                                 |
+| ------------------ | ---------------------- | --------------------------------------------------------------------------------------- |
+| `where`            | `findMany`             | a [filter](#filtering) object, or a drizzle `SQL` condition                             |
+| `limit`, `offset`  | `findMany`             | pagination; no limit by default (the REST API defaults to 10)                           |
+| `orderBy`          | `findMany`             | a field name (camelCase); an unknown field is ignored                                   |
+| `orderDirection`   | `findMany`             | `'asc'` (default) or `'desc'`                                                           |
+| `include`          | `findById`, `findMany` | relation names to load                                                                  |
+| `skipSanitization` | all                    | return hidden and create-only fields too                                                |
+| `withSoftDeleted`  | `findById`, `findMany` | include soft-deleted rows                                                               |
+| `trusted`          | `create`, `update`     | write `accept`-restricted fields — see [Trusted writes](#field-exposure-and-acceptance) |
 
 - **Includes go through the related model's domain.** Its find hooks run with the same `context` — so a hook that scopes
   reads, by tenant for instance, scopes included rows as well — and its exposure and soft-delete rules apply.

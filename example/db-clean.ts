@@ -55,9 +55,9 @@ try {
   await sql`DELETE FROM soft_delete_test_entity`;
   console.log('Cleaned soft_delete_test_entity');
 
-  // Demo tables
-  await sql`DELETE FROM advanced_demo`;
-  console.log('Cleaned advanced_demo');
+  // Demo tables (AdvancedDemo declares "schema": "analytics")
+  await sql`DELETE FROM analytics.advanced_demo`;
+  console.log('Cleaned analytics.advanced_demo');
 
   await sql`DELETE FROM data_type_demo`;
   console.log('Cleaned data_type_demo');

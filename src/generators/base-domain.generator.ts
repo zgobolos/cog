@@ -25,7 +25,7 @@ import { InvalidFilterException, NotFoundException } from './exceptions.ts';
 import { withoutTransaction, runAfterCommit, type DbTransaction } from '../db/database.ts';
 import { DomainHooks, DomainHookContext, QueryOptions } from './hooks.types.ts';
 import { buildWhereSQL, isWhereFilter, stripUnexposedFields, stripUnacceptedFields, validateFilter, type SQL, type FieldMeta } from '../utils/filter.utils.ts';
-import { getExposedFields, getCreateUnexposedFields, getReadUnexposedFields, getCreateUnacceptedFields, getUpdateUnacceptedFields } from '../utils/field-meta.utils.ts';
+import { getExposedFields, getCreateUnexposedFields, getReadUnexposedFields, getCreateUnacceptedFields, getUpdateUnacceptedFields, getTrustedCreateUnacceptedFields, getTrustedUpdateUnacceptedFields } from '../utils/field-meta.utils.ts';
 
 // ============================================
 // Types
@@ -60,6 +60,8 @@ interface DerivedFields {
   readUnexposedFields: string[];
   createUnacceptedFields: string[];
   updateUnacceptedFields: string[];
+  trustedCreateUnacceptedFields: string[];
+  trustedUpdateUnacceptedFields: string[];
 }
 
 // ============================================
@@ -93,6 +95,8 @@ export abstract class BaseDomain<
       readUnexposedFields: getReadUnexposedFields(config.fieldMeta),
       createUnacceptedFields: getCreateUnacceptedFields(config.fieldMeta),
       updateUnacceptedFields: getUpdateUnacceptedFields(config.fieldMeta),
+      trustedCreateUnacceptedFields: getTrustedCreateUnacceptedFields(config.fieldMeta),
+      trustedUpdateUnacceptedFields: getTrustedUpdateUnacceptedFields(config.fieldMeta),
     };
   }
 
@@ -149,10 +153,10 @@ export abstract class BaseDomain<
     options?: QueryOptions,
     context?: DomainHookContext<DomainEnvVars>,
   ): Promise<T> {
-    // Strip unaccepted fields from input (before any hooks)
+    // Strip unaccepted fields from input (before any hooks); a trusted write keeps all but COG's own columns
     const strippedInput = stripUnacceptedFields(
       input as unknown as Record<string, unknown>,
-      this.fields.createUnacceptedFields,
+      options?.trusted ? this.fields.trustedCreateUnacceptedFields : this.fields.createUnacceptedFields,
     );
 
     // Before-create hook (outside transaction, before validation)
@@ -362,10 +366,10 @@ export abstract class BaseDomain<
     options?: QueryOptions,
     context?: DomainHookContext<DomainEnvVars>,
   ): Promise<T> {
-    // Strip unaccepted fields from input (before any hooks)
+    // Strip unaccepted fields from input (before any hooks); a trusted write keeps all but COG's own columns
     const strippedInput = stripUnacceptedFields(
       input as unknown as Record<string, unknown>,
-      this.fields.updateUnacceptedFields,
+      options?.trusted ? this.fields.trustedUpdateUnacceptedFields : this.fields.updateUnacceptedFields,
     );
 
     // Before-update hook (outside transaction, before validation)

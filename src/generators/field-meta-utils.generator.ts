@@ -30,20 +30,31 @@ export interface FieldMeta {
   acceptCreate: boolean;
   /** Whether field is accepted in update (PUT) input */
   acceptUpdate: boolean;
+  /** Whether a trusted create (options.trusted) writes the field: false only for columns COG manages */
+  acceptTrustedCreate: boolean;
+  /** Whether a trusted update writes the field: false for columns COG manages and the primary key */
+  acceptTrustedUpdate: boolean;
 }
+
+/**
+ * Names of the fields whose metadata matches the predicate
+ */
+const fieldNamesWhere = (fieldMeta: Map<string, FieldMeta>, predicate: (meta: FieldMeta) => boolean): string[] => {
+  const fields: string[] = [];
+  for (const [name, meta] of fieldMeta) {
+    if (predicate(meta)) {
+      fields.push(name);
+    }
+  }
+  return fields;
+};
 
 /**
  * Get all fields that are exposed (visible) in responses
  * Used for filter validation - only exposed fields can be filtered
  */
 export const getExposedFields = (fieldMeta: Map<string, FieldMeta>): Set<string> => {
-  const exposed = new Set<string>();
-  for (const [name, meta] of fieldMeta) {
-    if (meta.exposeRead) {
-      exposed.add(name);
-    }
-  }
-  return exposed;
+  return new Set(fieldNamesWhere(fieldMeta, (meta) => meta.exposeRead));
 };
 
 /**
@@ -51,13 +62,7 @@ export const getExposedFields = (fieldMeta: Map<string, FieldMeta>): Set<string>
  * Fields where exposeCreate is false
  */
 export const getCreateUnexposedFields = (fieldMeta: Map<string, FieldMeta>): string[] => {
-  const fields: string[] = [];
-  for (const [name, meta] of fieldMeta) {
-    if (!meta.exposeCreate) {
-      fields.push(name);
-    }
-  }
-  return fields;
+  return fieldNamesWhere(fieldMeta, (meta) => !meta.exposeCreate);
 };
 
 /**
@@ -65,13 +70,7 @@ export const getCreateUnexposedFields = (fieldMeta: Map<string, FieldMeta>): str
  * Fields where exposeRead is false
  */
 export const getReadUnexposedFields = (fieldMeta: Map<string, FieldMeta>): string[] => {
-  const fields: string[] = [];
-  for (const [name, meta] of fieldMeta) {
-    if (!meta.exposeRead) {
-      fields.push(name);
-    }
-  }
-  return fields;
+  return fieldNamesWhere(fieldMeta, (meta) => !meta.exposeRead);
 };
 
 /**
@@ -79,13 +78,7 @@ export const getReadUnexposedFields = (fieldMeta: Map<string, FieldMeta>): strin
  * Fields where acceptCreate is false (e.g., timestamps, server-managed fields)
  */
 export const getCreateUnacceptedFields = (fieldMeta: Map<string, FieldMeta>): string[] => {
-  const fields: string[] = [];
-  for (const [name, meta] of fieldMeta) {
-    if (!meta.acceptCreate) {
-      fields.push(name);
-    }
-  }
-  return fields;
+  return fieldNamesWhere(fieldMeta, (meta) => !meta.acceptCreate);
 };
 
 /**
@@ -93,13 +86,22 @@ export const getCreateUnacceptedFields = (fieldMeta: Map<string, FieldMeta>): st
  * Fields where acceptUpdate is false (e.g., id, timestamps, immutable fields)
  */
 export const getUpdateUnacceptedFields = (fieldMeta: Map<string, FieldMeta>): string[] => {
-  const fields: string[] = [];
-  for (const [name, meta] of fieldMeta) {
-    if (!meta.acceptUpdate) {
-      fields.push(name);
-    }
-  }
-  return fields;
+  return fieldNamesWhere(fieldMeta, (meta) => !meta.acceptUpdate);
+};
+
+/**
+ * Get fields to strip from a trusted create's input: only the columns COG manages
+ * (timestamps, soft-delete column)
+ */
+export const getTrustedCreateUnacceptedFields = (fieldMeta: Map<string, FieldMeta>): string[] => {
+  return fieldNamesWhere(fieldMeta, (meta) => !meta.acceptTrustedCreate);
+};
+
+/**
+ * Get fields to strip from a trusted update's input: the columns COG manages and the primary key
+ */
+export const getTrustedUpdateUnacceptedFields = (fieldMeta: Map<string, FieldMeta>): string[] => {
+  return fieldNamesWhere(fieldMeta, (meta) => !meta.acceptTrustedUpdate);
 };
 
 /**

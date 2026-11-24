@@ -1009,9 +1009,14 @@ export class DrizzleSchemaGenerator {
       const exposeConfig = normalizeExpose(field.expose);
       const acceptConfig = normalizeAccept(getEffectiveAccept(field));
       const isArray = field.array === true;
+      // A trusted write (options.trusted) lifts the model's accept rules, but never writes the
+      // columns COG adds itself (timestamps, soft-delete) nor, on update, the primary key
+      const managedByCog = !model.fields.includes(field);
+      const trustedCreate = !managedByCog;
+      const trustedUpdate = !managedByCog && !field.primaryKey;
 
       entries.push(
-        `  ['${field.name}', { type: '${field.type}', array: ${isArray}, exposeCreate: ${exposeConfig.create}, exposeRead: ${exposeConfig.read}, acceptCreate: ${acceptConfig.create}, acceptUpdate: ${acceptConfig.update} }]`,
+        `  ['${field.name}', { type: '${field.type}', array: ${isArray}, exposeCreate: ${exposeConfig.create}, exposeRead: ${exposeConfig.read}, acceptCreate: ${acceptConfig.create}, acceptUpdate: ${acceptConfig.update}, acceptTrustedCreate: ${trustedCreate}, acceptTrustedUpdate: ${trustedUpdate} }]`,
       );
     }
 

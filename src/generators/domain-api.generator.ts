@@ -76,6 +76,12 @@ export interface QueryOptions {
 
   // Soft-delete control (find* methods, default: false): include soft-deleted rows
   withSoftDeleted?: boolean;
+
+  // Trusted write (create/update, default: false): server code writing its own values. Lifts the
+  // model's accept rules (accept: "never", and "create" on update); the columns COG manages -
+  // timestamps, the soft-delete column, the primary key on update - stay stripped. Never set it
+  // from request input, nor while forwarding a caller's input; the generated REST layer never does.
+  trusted?: boolean;
 }
 
 
@@ -224,7 +230,7 @@ ${this.generateRelationImports(model)}
 ${this.generateJunctionTableImports(model)}
 import { DomainHooks, JunctionTableHooks, DomainHookContext, QueryOptions } from './hooks.types.ts';
 import { buildWhereSQL, isWhereFilter, stripUnexposedFields, stripUnacceptedFields, validateFilter, type SQL } from '../utils/filter.utils.ts';
-import { getExposedFields, getCreateUnexposedFields, getReadUnexposedFields, getCreateUnacceptedFields, getUpdateUnacceptedFields } from '../utils/field-meta.utils.ts';
+import { getExposedFields, getCreateUnexposedFields, getReadUnexposedFields, getCreateUnacceptedFields, getUpdateUnacceptedFields, getTrustedCreateUnacceptedFields, getTrustedUpdateUnacceptedFields } from '../utils/field-meta.utils.ts';
 ${junctionUtilImports}
 
 // Derive field arrays from metadata at module load
@@ -233,6 +239,8 @@ const ${modelNameLower}CreateUnexposedFields = getCreateUnexposedFields(${modelN
 const ${modelNameLower}ReadUnexposedFields = getReadUnexposedFields(${modelNameLower}FieldMeta);
 const ${modelNameLower}CreateUnacceptedFields = getCreateUnacceptedFields(${modelNameLower}FieldMeta);
 const ${modelNameLower}UpdateUnacceptedFields = getUpdateUnacceptedFields(${modelNameLower}FieldMeta);
+const ${modelNameLower}TrustedCreateUnacceptedFields = getTrustedCreateUnacceptedFields(${modelNameLower}FieldMeta);
+const ${modelNameLower}TrustedUpdateUnacceptedFields = getTrustedUpdateUnacceptedFields(${modelNameLower}FieldMeta);
 
 export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = Record<string, unknown>> {
   private hooks: DomainHooks<${modelName}, New${modelName}, Partial<New${modelName}>, DomainEnvVars>;
@@ -250,8 +258,11 @@ export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = 
    * Create a new ${modelName}
    */
   async create(input: New${modelName}, tx: DbTransaction, options?: QueryOptions, context?: DomainHookContext<DomainEnvVars>): Promise<${modelName}> {
-    // Strip unaccepted fields from input (before any hooks)
-    const strippedInput = stripUnacceptedFields(input as unknown as Record<string, unknown>, ${modelNameLower}CreateUnacceptedFields);
+    // Strip unaccepted fields from input (before any hooks); a trusted write keeps all but COG's own columns
+    const strippedInput = stripUnacceptedFields(
+      input as unknown as Record<string, unknown>,
+      options?.trusted ? ${modelNameLower}TrustedCreateUnacceptedFields : ${modelNameLower}CreateUnacceptedFields,
+    );
 
     // Before-create hook (outside transaction, before validation)
     // Hook can inject server-managed fields that were stripped
@@ -466,8 +477,11 @@ export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = 
    * Update ${modelName}
    */
   async update(id: string, input: Partial<New${modelName}>, tx: DbTransaction, options?: QueryOptions, context?: DomainHookContext<DomainEnvVars>): Promise<${modelName}> {
-    // Strip unaccepted fields from input (before any hooks)
-    const strippedInput = stripUnacceptedFields(input as unknown as Record<string, unknown>, ${modelNameLower}UpdateUnacceptedFields);
+    // Strip unaccepted fields from input (before any hooks); a trusted write keeps all but COG's own columns
+    const strippedInput = stripUnacceptedFields(
+      input as unknown as Record<string, unknown>,
+      options?.trusted ? ${modelNameLower}TrustedUpdateUnacceptedFields : ${modelNameLower}UpdateUnacceptedFields,
+    );
 
     // Before-update hook (outside transaction, before validation)
     // Hook can inject server-managed fields that were stripped

@@ -47,6 +47,7 @@ cog/
 ├── .vscode/                                # VSCode Deno configuration
 ├── deno.json                               # Root workspace config & tasks
 ├── AGENTS.md                               # This file
+├── CHANGELOG.md                            # Release notes per version (tag = version, no v prefix)
 └── README.md                               # User-facing documentation
 ```
 
@@ -273,14 +274,22 @@ modifiers: `text('x').notNull().array()` was a nullable column (and so was its Z
 key lost.
 
 **Defaults** (`generateDefaultModifier`, `getDefaultSql` in `src/utils/field.utils.ts`): `defaultSql` is an SQL
-expression emitted as
-`sql\`...\``; a`defaultValue`string containing`()`is the older convention for the same and
-still read as SQL. Any other`defaultValue`is a value emitted as a literal that drizzle serializes - strings single
-quoted and escaped, everything else via`JSON.stringify`. So an array field takes`[]`(the parser refuses a string such
-as`'{}'`, which drizzle would pass as a string), a`json`/`jsonb`field any JSON value (`[]`becomes`'[]'::jsonb`;`'[]'`would be the JSON string), and arrays/objects are refused elsewhere. A function call as a json/jsonb default
-(`jsonb_build_array()`) gets a parser warning: drizzle-kit reads json defaults back with`JSON.parse`during push and
-fails on every later change. Parser warnings are printed (`console.warn`)
-and do not stop generation.
+expression, emitted inside drizzle's `sql` template tag; a `defaultValue` string containing `()` is the older convention
+for the same and still read as SQL. Any other `defaultValue` is a value emitted as a literal that drizzle serializes -
+strings single quoted and escaped, everything else via `JSON.stringify`. So an array field takes `[]` (the parser
+refuses a string such as `'{}'`, which drizzle would pass as a string), a `json`/`jsonb` field any JSON value (`[]`
+becomes `'[]'::jsonb`; `'[]'` would be the JSON string), and arrays/objects are refused elsewhere. A function call as a
+json/jsonb default (`jsonb_build_array()`) gets a parser warning: drizzle-kit reads json defaults back with `JSON.parse`
+during push and fails on every later change. Parser warnings are printed (`console.warn`) and do not stop generation.
+
+**Trusted writes** (`QueryOptions.trusted`): `accept` guards outside input, so `create()`/`update()` strip unaccepted
+fields for every caller - which also kept server code from writing its own values (an `endDate`, an `archivedAt`) and
+pushed it to direct Drizzle writes that skip every hook. With `{ trusted: true }` the domain strips only the columns COG
+manages: `FieldMeta.acceptTrustedCreate`/`acceptTrustedUpdate` are false for the fields `getAllFieldsWithTimestamps`
+adds (timestamps, the soft-delete column - a soft delete has to go through `delete()` and its hooks) and, on update, for
+the primary key; `getTrustedCreateUnacceptedFields`/`getTrustedUpdateUnacceptedFields` derive the lists. Zod, the hook
+order, the timestamps and the error handling are unchanged. The CRUD factory passes a literal `{}` as options, so REST
+never sets it; options must never be built from request input.
 
 ## Relationships
 

@@ -336,7 +336,7 @@ Deno.test('generator - soft delete schema column and field meta', async () => {
     // Field meta hidden + never-accept
     assertEquals(
       schema.includes(
-        "['deletedAt', { type: 'date', array: false, exposeCreate: false, exposeRead: false, acceptCreate: false, acceptUpdate: false }]",
+        "['deletedAt', { type: 'date', array: false, exposeCreate: false, exposeRead: false, acceptCreate: false, acceptUpdate: false, acceptTrustedCreate: false, acceptTrustedUpdate: false }]",
       ),
       true,
     );
@@ -1404,6 +1404,65 @@ Deno.test('generator - before-hooks must return the input to validate', async ()
       ),
       true,
     );
+  } finally {
+    await cleanupModifiers();
+  }
+});
+
+// accept guards outside input; server code passes { trusted: true } to write its own values through the
+// domain, so the hooks run. The columns COG manages stay stripped, and the REST layer never sets it.
+Deno.test('generator - trusted writes lift accept rules for server code only', async () => {
+  await cleanupModifiers();
+  try {
+    await generateWithModels([{
+      name: 'Ownership',
+      tableName: 'ownership',
+      fields: [
+        modifierIdField,
+        { name: 'note', type: 'text' },
+        { name: 'startDate', type: 'date', accept: 'create' },
+        { name: 'endDate', type: 'date', accept: 'never' },
+      ],
+      timestamps: true,
+      softDelete: true,
+    }]);
+    const read = (path: string): Promise<string> => Deno.readTextFile(`${MODIFIER_OUTPUT}/${path}`);
+    const schema = await read('schema/ownership.schema.ts');
+    const hasTrustedFlags = (field: string, trustedCreate: boolean, trustedUpdate: boolean): boolean =>
+      new RegExp(
+        `\\['${field}', \\{[^}]*acceptTrustedCreate: ${trustedCreate}, acceptTrustedUpdate: ${trustedUpdate} \\}\\]`,
+      ).test(schema);
+
+    // The model's accept rules are lifted; timestamps, the soft-delete column and the primary key on update are not
+    assertEquals(hasTrustedFlags('id', true, false), true);
+    assertEquals(hasTrustedFlags('note', true, true), true);
+    assertEquals(hasTrustedFlags('startDate', true, true), true);
+    assertEquals(hasTrustedFlags('endDate', true, true), true);
+    assertEquals(hasTrustedFlags('createdAt', false, false), true);
+    assertEquals(hasTrustedFlags('updatedAt', false, false), true);
+    assertEquals(hasTrustedFlags('deletedAt', false, false), true);
+
+    const domain = await read('domain/ownership.domain.ts');
+    assertEquals(
+      domain.includes('options?.trusted ? ownershipTrustedCreateUnacceptedFields : ownershipCreateUnacceptedFields'),
+      true,
+    );
+    assertEquals(
+      domain.includes('options?.trusted ? ownershipTrustedUpdateUnacceptedFields : ownershipUpdateUnacceptedFields'),
+      true,
+    );
+    const baseDomain = await read('domain/base.domain.ts');
+    assertEquals(
+      (baseDomain.match(/options\?\.trusted \? this\.fields\.trusted(Create|Update)UnacceptedFields/g) ?? []).length,
+      2,
+    );
+    assertEquals((await read('domain/hooks.types.ts')).includes('trusted?: boolean;'), true);
+
+    // The REST layer passes a literal {} - never options built from the request
+    const factory = await read('rest/crud.factory.ts');
+    assertEquals(factory.includes('config.domain.create(body, tx, {}, context)'), true);
+    assertEquals(factory.includes('config.domain.update(id, body, tx, {}, context)'), true);
+    assertEquals(factory.includes('trusted'), false);
   } finally {
     await cleanupModifiers();
   }

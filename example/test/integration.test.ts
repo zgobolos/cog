@@ -16,6 +16,7 @@ import { assert, assertEquals, assertExists, assertMatch } from '@std/assert';
 import { eq } from 'drizzle-orm';
 import {
   type AcceptanceTestEntity,
+  AcceptanceTestEntityDomain,
   type Assignment,
   type Department,
   type Employee,
@@ -1692,6 +1693,88 @@ async function runTests(): Promise<void> {
   const notUtf8 = await REQUEST('GET', `/api/skill?where=${encodeURIComponent(btoa('\xff\xfe'))}`);
   assertEquals(notUtf8.status, 400, 'bytes that are not UTF-8 are a 400');
   logSuccess('✓ Filters carry UTF-8 values');
+
+  // ========================================
+  // 26. TRUSTED WRITES
+  // ========================================
+  logSection('26. Testing Trusted Writes (options.trusted)');
+
+  // accept guards outside input. Server code that writes its own value into an accept: "never" field
+  // (or a create-only field on update) passes { trusted: true } and keeps every hook; the columns COG
+  // manages stay out of reach, and the REST layer never sets the option.
+  const trustedHooks: string[] = [];
+  let trustedBeforeUpdateInput: Record<string, unknown> | undefined;
+  const trustedDomain = new AcceptanceTestEntityDomain({
+    beforeUpdate: (_id, rawInput) => {
+      trustedHooks.push('beforeUpdate');
+      trustedBeforeUpdateInput = rawInput as Record<string, unknown>;
+      return Promise.resolve(rawInput as Record<string, unknown>);
+    },
+    preUpdate: (_id, input) => {
+      trustedHooks.push('preUpdate');
+      return Promise.resolve(input);
+    },
+    postUpdate: (_id, _input, result) => {
+      trustedHooks.push('postUpdate');
+      return Promise.resolve(result);
+    },
+    afterUpdate: () => {
+      trustedHooks.push('afterUpdate');
+      return Promise.resolve();
+    },
+  });
+
+  logStep('26.1 A trusted create writes an accept: "never" field, but not a timestamp');
+  const trustedCreated = await withTransaction((tx) =>
+    trustedDomain.create({ normalField: 'trusted', neverAcceptedField: 'server-set', createdAt: 1 }, tx, {
+      trusted: true,
+    })
+  );
+  createdIds.acceptanceTestEntities.push(trustedCreated.id);
+  assertEquals(trustedCreated.neverAcceptedField, 'server-set', 'the never field is written');
+  assert(trustedCreated.createdAt !== 1, 'createdAt stays managed by COG');
+
+  logStep('26.2 An update without options still strips it');
+  const untrustedUpdated = await withTransaction((tx) =>
+    trustedDomain.update(trustedCreated.id, { neverAcceptedField: 'outside', createOnlyField: 'outside' }, tx)
+  );
+  assertEquals(untrustedUpdated.neverAcceptedField, 'server-set', 'the never field is unchanged');
+  assertEquals(untrustedUpdated.createOnlyField, null, 'the create-only field is unchanged');
+
+  logStep('26.3 A trusted update writes never and create-only fields, keeps the id and runs every hook');
+  trustedHooks.length = 0;
+  const trustedUpdated = await withTransaction((tx) =>
+    trustedDomain.update(
+      trustedCreated.id,
+      {
+        neverAcceptedField: 'server-updated',
+        createOnlyField: 'rewritten',
+        id: crypto.randomUUID(),
+      },
+      tx,
+      { trusted: true },
+    )
+  );
+  assertEquals(trustedUpdated.id, trustedCreated.id, 'the primary key stays out of reach');
+  assertEquals(trustedUpdated.neverAcceptedField, 'server-updated', 'the never field is written');
+  assertEquals(trustedUpdated.createOnlyField, 'rewritten', 'the create-only field is written');
+  assertEquals(trustedBeforeUpdateInput?.neverAcceptedField, 'server-updated', 'beforeUpdate sees the field');
+  // afterUpdate starts after COMMIT, not awaited - it may already be in the list
+  assertEquals(trustedHooks.slice(0, 3), ['beforeUpdate', 'preUpdate', 'postUpdate'], 'the hooks ran in order');
+  await waitUntil(() => trustedHooks.includes('afterUpdate'), 'afterUpdate of the trusted update');
+
+  logStep('26.4 REST POST and PUT still strip the field');
+  const restCreated = await POST('/api/acceptancetestentity', {
+    normalField: 'rest',
+    neverAcceptedField: 'from-client',
+  }) as AcceptanceTestEntity;
+  createdIds.acceptanceTestEntities.push(restCreated.id);
+  assertEquals(restCreated.neverAcceptedField, 'server-generated', 'POST keeps the default');
+  const restUpdated = await PUT(`/api/acceptancetestentity/${restCreated.id}`, {
+    neverAcceptedField: 'from-client',
+  }) as AcceptanceTestEntity;
+  assertEquals(restUpdated.neverAcceptedField, 'server-generated', 'PUT does not write it');
+  logSuccess('✓ Trusted writes lift accept for server code only, with every hook');
 
   // ========================================
   // SUCCESS
