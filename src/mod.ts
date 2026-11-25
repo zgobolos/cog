@@ -14,7 +14,6 @@ import { OpenAPIBuilderGenerator } from './generators/openapi-builder.generator.
 import { FilterUtilsGenerator } from './generators/filter-utils.generator.ts';
 import { JunctionUtilsGenerator } from './generators/junction-utils.generator.ts';
 import { FieldMetaUtilsGenerator } from './generators/field-meta-utils.generator.ts';
-import { BaseDomainGenerator } from './generators/base-domain.generator.ts';
 import { GeneratorConfig, ModelDefinition } from './types/model.types.ts';
 import { type DependencyReport, resolveDependencies } from './utils/dependency.utils.ts';
 import { isPostGISType } from './constants.ts';
@@ -136,10 +135,6 @@ export async function generateFromModels(
     const junctionUtilsGenerator = new JunctionUtilsGenerator();
     files.set('domain/junction.utils.ts', junctionUtilsGenerator.generate());
   }
-
-  // Generate base domain class
-  const baseDomainGenerator = new BaseDomainGenerator();
-  files.set('domain/base.domain.ts', baseDomainGenerator.generate());
 
   // Generate domain APIs
   const domainGenerator = new DomainAPIGenerator(models);

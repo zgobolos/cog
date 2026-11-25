@@ -1078,16 +1078,14 @@ Deno.test('generator - after* hooks start once their transaction has committed',
     const read = (path: string): Promise<string> => Deno.readTextFile(`${AFTER_COMMIT_OUTPUT}/${path}`);
     const database = await read('db/database.ts');
     const domain = await read('domain/tag.domain.ts');
-    const baseDomain = await read('domain/base.domain.ts');
     const junction = await read('domain/junction.utils.ts');
 
     // setTimeout inside the transaction callback fired before COMMIT, and even after a rollback
-    for (const file of [domain, baseDomain, junction]) {
+    for (const file of [domain, junction]) {
       assertEquals(file.includes('setTimeout'), false);
     }
     for (const hook of ['afterCreate', 'afterUpdate', 'afterDelete', 'afterFindById', 'afterFindMany']) {
       assertEquals(domain.includes(`runAfterCommit(tx, () => ${hook}(`), true, `domain: ${hook}`);
-      assertEquals(baseDomain.includes(`runAfterCommit(tx, () => ${hook}(`), true, `base domain: ${hook}`);
     }
     for (const hook of ['afterAddJunction', 'afterRemoveJunction']) {
       assertEquals(junction.includes(`runAfterCommit(tx, () => ${hook}(`), true, `junction: ${hook}`);
@@ -1450,11 +1448,6 @@ Deno.test('generator - trusted writes lift accept rules for server code only', a
     assertEquals(
       domain.includes('options?.trusted ? ownershipTrustedUpdateUnacceptedFields : ownershipUpdateUnacceptedFields'),
       true,
-    );
-    const baseDomain = await read('domain/base.domain.ts');
-    assertEquals(
-      (baseDomain.match(/options\?\.trusted \? this\.fields\.trusted(Create|Update)UnacceptedFields/g) ?? []).length,
-      2,
     );
     assertEquals((await read('domain/hooks.types.ts')).includes('trusted?: boolean;'), true);
 

@@ -24,7 +24,6 @@ cog/
 │       ├── database-init.generator.ts      # DB connection & init
 │       ├── domain-api.generator.ts         # Business logic layer (per-model)
 │       ├── domain-exceptions.generator.ts  # Exception classes
-│       ├── base-domain.generator.ts        # Abstract base domain class
 │       ├── junction-utils.generator.ts     # Many-to-many junction utilities
 │       ├── rest-api.generator.ts           # Hono REST endpoints (per-model)
 │       ├── rest-crud-factory.generator.ts  # Generic CRUD handler factory
@@ -96,7 +95,6 @@ generated/
 │   └── relations.ts            # Drizzle relationships
 ├── domain/
 │   ├── [model].domain.ts       # CRUD operations with hooks (per-model)
-│   ├── base.domain.ts          # Abstract base class with shared CRUD logic
 │   ├── junction.utils.ts       # Many-to-many relationship utilities
 │   ├── exceptions.ts           # DomainException, NotFoundException, InvalidFilterException
 │   └── hooks.types.ts          # Hook type definitions
@@ -180,8 +178,9 @@ Each model has a domain class with CRUD operations and hook orchestration:
 - Relationship loading via `include` parameter
 - Field sanitization (strip unexposed/unaccepted fields)
 
-The `base.domain.ts` provides an abstract `BaseDomain<T, TNew>` class with shared CRUD logic. The `junction.utils.ts`
-provides utilities for many-to-many relationships.
+The `junction.utils.ts` provides utilities for many-to-many relationships. (Until 2.4 COG also emitted a
+`domain/base.domain.ts` with an abstract `BaseDomain`; no domain extended it, `domain/index.ts` did not export it and it
+had no soft delete, so 2.5.0 removed it rather than keep a second copy of every write path.)
 
 ### OpenAPI (Dynamic Generation)
 

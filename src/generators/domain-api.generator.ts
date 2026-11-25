@@ -77,10 +77,11 @@ export interface QueryOptions {
   // Soft-delete control (find* methods, default: false): include soft-deleted rows
   withSoftDeleted?: boolean;
 
-  // Trusted write (create/update, default: false): server code writing its own values. Lifts the
-  // model's accept rules (accept: "never", and "create" on update); the columns COG manages -
-  // timestamps, the soft-delete column, the primary key on update - stay stripped. Never set it
-  // from request input, nor while forwarding a caller's input; the generated REST layer never does.
+  // Trusted write (create/update/delete, default: false): server code writing its own values. Lifts
+  // the model's accept rules (accept: "never", and "create" on update); the columns COG manages -
+  // timestamps, the soft-delete column, the primary key on update - stay stripped. The write hooks see
+  // it as meta.trusted (a delete only forwards it). Never set it from request input, nor while
+  // forwarding a caller's input; the generated REST layer never does.
   trusted?: boolean;
 }
 
@@ -105,17 +106,38 @@ export interface QueryOptions {
  * Hooks return the data directly (not wrapped in an object).
  * Context is passed as a parameter for read access.
  */
+/**
+ * What a write hook (create, update, delete) knows about the call it runs in.
+ */
+export interface WriteHookMeta {
+  // options.trusted of this call: server code writing its own values. Never inherited - a hook's own
+  // domain calls pass their own options - and never set by the generated REST layer
+  trusted: boolean;
+  // options.increment of an update (field -> amount added in SQL); undefined otherwise
+  increment?: Readonly<Record<string, number>>;
+}
+
+/**
+ * The meta of a before* write hook: also the caller's transaction, which is already open
+ */
+export interface BeforeWriteHookMeta extends WriteHookMeta {
+  tx: DbTransaction;
+}
+
 export interface DomainHooks<T, CreateInput, UpdateInput, DomainEnvVars extends Record<string, unknown> = Record<string, unknown>> {
-  // Before-operation hooks (outside transaction, before validation)
-  // Note: These run BEFORE any validation, receive raw input
+  // Before-operation hooks (inside the caller's transaction, before validation)
+  // Note: These run BEFORE any validation, receive the input without the fields the model does not accept
   // Note: Can transform input, perform auth checks, or reject requests
-  // Note: Throwing an exception aborts the operation before anything is written
-  // Note: NO transaction parameter - runs outside transaction like after hooks
+  // Note: Throwing an exception aborts the operation before this call writes anything
+  // Note: The write hooks get the caller's transaction as meta.tx - read through it, not through
+  //       withoutTransaction(): it sees the rows this transaction wrote, and needs no second connection
   // Note: beforeCreate/beforeUpdate return the input to validate - a hook that only mutates
   //       rawInput and returns nothing is a type error, not an empty input at runtime
-  beforeCreate?: (rawInput: unknown, context?: DomainHookContext<DomainEnvVars>) => Promise<Record<string, unknown>>;
-  beforeUpdate?: (id: string, rawInput: unknown, context?: DomainHookContext<DomainEnvVars>) => Promise<Record<string, unknown>>;
-  beforeDelete?: (id: string, context?: DomainHookContext<DomainEnvVars>) => Promise<void>;
+  // Note: A hook may declare fewer parameters than it is given; code that CALLS a hook (a composer)
+  //       has to pass meta
+  beforeCreate?: (rawInput: unknown, context: DomainHookContext<DomainEnvVars> | undefined, meta: BeforeWriteHookMeta) => Promise<Record<string, unknown>>;
+  beforeUpdate?: (id: string, rawInput: unknown, context: DomainHookContext<DomainEnvVars> | undefined, meta: BeforeWriteHookMeta) => Promise<Record<string, unknown>>;
+  beforeDelete?: (id: string, context: DomainHookContext<DomainEnvVars> | undefined, meta: BeforeWriteHookMeta) => Promise<void>;
   beforeFindById?: (id: string, context?: DomainHookContext<DomainEnvVars>) => Promise<string>;
   beforeFindMany?: (options: QueryOptions, context?: DomainHookContext<DomainEnvVars>) => Promise<QueryOptions>;
 
@@ -124,16 +146,16 @@ export interface DomainHooks<T, CreateInput, UpdateInput, DomainEnvVars extends 
   // Note: Output will be validated before the main operation
   // Note: context contains all variables from your Env type
   // Note: rawInput contains the original unvalidated request body (use with caution)
-  preCreate?: (input: CreateInput, rawInput: unknown, tx: DbTransaction, context?: DomainHookContext<DomainEnvVars>) => Promise<CreateInput>;
-  preUpdate?: (id: string, input: UpdateInput, rawInput: unknown, tx: DbTransaction, context?: DomainHookContext<DomainEnvVars>) => Promise<UpdateInput>;
-  preDelete?: (id: string, tx: DbTransaction, context?: DomainHookContext<DomainEnvVars>) => Promise<{ id: string }>;
+  preCreate?: (input: CreateInput, rawInput: unknown, tx: DbTransaction, context: DomainHookContext<DomainEnvVars> | undefined, meta: WriteHookMeta) => Promise<CreateInput>;
+  preUpdate?: (id: string, input: UpdateInput, rawInput: unknown, tx: DbTransaction, context: DomainHookContext<DomainEnvVars> | undefined, meta: WriteHookMeta) => Promise<UpdateInput>;
+  preDelete?: (id: string, tx: DbTransaction, context: DomainHookContext<DomainEnvVars> | undefined, meta: WriteHookMeta) => Promise<{ id: string }>;
   preFindById?: (id: string, tx?: DbTransaction, context?: DomainHookContext<DomainEnvVars>) => Promise<{ id: string }>;
   preFindMany?: (tx?: DbTransaction, options?: QueryOptions, context?: DomainHookContext<DomainEnvVars>) => Promise<QueryOptions>;
 
   // Post-operation hooks (within transaction)
-  postCreate?: (input: CreateInput, result: T, rawInput: unknown, tx: DbTransaction, context?: DomainHookContext<DomainEnvVars>) => Promise<T>;
-  postUpdate?: (id: string, input: UpdateInput, result: T, rawInput: unknown, tx: DbTransaction, context?: DomainHookContext<DomainEnvVars>) => Promise<T>;
-  postDelete?: (id: string, result: T, tx: DbTransaction, context?: DomainHookContext<DomainEnvVars>) => Promise<T>;
+  postCreate?: (input: CreateInput, result: T, rawInput: unknown, tx: DbTransaction, context: DomainHookContext<DomainEnvVars> | undefined, meta: WriteHookMeta) => Promise<T>;
+  postUpdate?: (id: string, input: UpdateInput, result: T, rawInput: unknown, tx: DbTransaction, context: DomainHookContext<DomainEnvVars> | undefined, meta: WriteHookMeta) => Promise<T>;
+  postDelete?: (id: string, result: T, tx: DbTransaction, context: DomainHookContext<DomainEnvVars> | undefined, meta: WriteHookMeta) => Promise<T>;
   postFindById?: (id: string, result: T | null, tx?: DbTransaction, context?: DomainHookContext<DomainEnvVars>) => Promise<T | null>;
   postFindMany?: (options: QueryOptions, results: T[], tx?: DbTransaction, context?: DomainHookContext<DomainEnvVars>) => Promise<T[]>;
 
@@ -141,9 +163,9 @@ export interface DomainHooks<T, CreateInput, UpdateInput, DomainEnvVars extends 
   // Note: Start once the transaction has committed - the outermost one, for a nested transaction
   // Note: A rollback drops them; a read without a transaction starts them right away
   // Note: Receive the same result the caller gets (sanitized unless skipSanitization is set)
-  afterCreate?: (result: T, rawInput: unknown, context?: DomainHookContext<DomainEnvVars>) => Promise<void>;
-  afterUpdate?: (result: T, rawInput: unknown, context?: DomainHookContext<DomainEnvVars>) => Promise<void>;
-  afterDelete?: (result: T, context?: DomainHookContext<DomainEnvVars>) => Promise<void>;
+  afterCreate?: (result: T, rawInput: unknown, context: DomainHookContext<DomainEnvVars> | undefined, meta: WriteHookMeta) => Promise<void>;
+  afterUpdate?: (result: T, rawInput: unknown, context: DomainHookContext<DomainEnvVars> | undefined, meta: WriteHookMeta) => Promise<void>;
+  afterDelete?: (result: T, context: DomainHookContext<DomainEnvVars> | undefined, meta: WriteHookMeta) => Promise<void>;
   afterFindById?: (result: T | null, context?: DomainHookContext<DomainEnvVars>) => Promise<void>;
   afterFindMany?: (results: T[], context?: DomainHookContext<DomainEnvVars>) => Promise<void>;
 }
@@ -228,7 +250,7 @@ import { withoutTransaction, runAfterCommit, type DbTransaction } from '../db/da
 import { ${modelNameLower}Table, type ${modelName}, type New${modelName}, ${modelNameLower}InsertSchema, ${modelNameLower}UpdateSchema, ${modelNameLower}FieldMeta } from '../schema/${modelNameLower}.schema.ts';
 ${this.generateRelationImports(model)}
 ${this.generateJunctionTableImports(model)}
-import { DomainHooks, JunctionTableHooks, DomainHookContext, QueryOptions } from './hooks.types.ts';
+import { DomainHooks, JunctionTableHooks, DomainHookContext, QueryOptions, type WriteHookMeta } from './hooks.types.ts';
 import { buildWhereSQL, isWhereFilter, stripUnexposedFields, stripUnacceptedFields, validateFilter, type SQL } from '../utils/filter.utils.ts';
 import { getExposedFields, getCreateUnexposedFields, getReadUnexposedFields, getCreateUnacceptedFields, getUpdateUnacceptedFields, getTrustedCreateUnacceptedFields, getTrustedUpdateUnacceptedFields } from '../utils/field-meta.utils.ts';
 ${junctionUtilImports}
@@ -264,11 +286,13 @@ export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = 
       options?.trusted ? ${modelNameLower}TrustedCreateUnacceptedFields : ${modelNameLower}CreateUnacceptedFields,
     );
 
-    // Before-create hook (outside transaction, before validation)
+    const meta: WriteHookMeta = { trusted: options?.trusted === true };
+
+    // Before-create hook (in the caller's transaction, before validation)
     // Hook can inject server-managed fields that were stripped
     let transformedInput: unknown = strippedInput;
     if (this.hooks.beforeCreate) {
-      transformedInput = await this.hooks.beforeCreate(strippedInput, context);
+      transformedInput = await this.hooks.beforeCreate(strippedInput, context, { ...meta, tx });
     }
 
     // Validate input before pre-hook
@@ -277,7 +301,7 @@ export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = 
     // Pre-create hook (within transaction)
     let processedInput = validatedInput;
     if (this.hooks.preCreate) {
-      processedInput = await this.hooks.preCreate(validatedInput, input, tx, context);
+      processedInput = await this.hooks.preCreate(validatedInput, input, tx, context, meta);
       // Validate pre-hook output to ensure it didn't emit malformed data
       processedInput = ${modelNameLower}InsertSchema.parse(processedInput) as New${modelName};
     }
@@ -293,7 +317,7 @@ export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = 
     // Post-create hook (within transaction)
     let result = created;
     if (this.hooks.postCreate) {
-      result = await this.hooks.postCreate(processedInput, created, input, tx, context);
+      result = await this.hooks.postCreate(processedInput, created, input, tx, context, meta);
     }
 
     // Sanitize response (strip unexposed fields) unless skipped
@@ -305,7 +329,7 @@ export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = 
     // After-create hook: starts once the transaction has committed, receives what the caller gets
     if (this.hooks.afterCreate) {
       const afterCreate = this.hooks.afterCreate;
-      runAfterCommit(tx, () => afterCreate(result, input, context));
+      runAfterCommit(tx, () => afterCreate(result, input, context, meta));
     }
 
     return result;
@@ -483,11 +507,13 @@ export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = 
       options?.trusted ? ${modelNameLower}TrustedUpdateUnacceptedFields : ${modelNameLower}UpdateUnacceptedFields,
     );
 
-    // Before-update hook (outside transaction, before validation)
+    const meta: WriteHookMeta = { trusted: options?.trusted === true };
+
+    // Before-update hook (in the caller's transaction, before validation)
     // Hook can inject server-managed fields that were stripped
     let transformedInput: unknown = strippedInput;
     if (this.hooks.beforeUpdate) {
-      transformedInput = await this.hooks.beforeUpdate(id, strippedInput, context);
+      transformedInput = await this.hooks.beforeUpdate(id, strippedInput, context, { ...meta, tx });
     }
 
     // Validate input before pre-hook (partial update)
@@ -496,7 +522,7 @@ export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = 
     // Pre-update hook
     let processedInput = validatedInput;
     if (this.hooks.preUpdate) {
-      processedInput = await this.hooks.preUpdate(id, validatedInput, input, tx, context);
+      processedInput = await this.hooks.preUpdate(id, validatedInput, input, tx, context, meta);
       // Validate pre-hook output to ensure it didn't emit malformed data
       processedInput = ${modelNameLower}UpdateSchema.parse(processedInput) as Partial<New${modelName}>;
     }
@@ -524,7 +550,7 @@ export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = 
     // Post-update hook
     let result = updated;
     if (this.hooks.postUpdate) {
-      result = await this.hooks.postUpdate(id, processedInput, updated, input, tx, context);
+      result = await this.hooks.postUpdate(id, processedInput, updated, input, tx, context, meta);
     }
 
     // Sanitize response (strip unexposed fields) unless skipped
@@ -535,7 +561,7 @@ export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = 
     // After-update hook: starts once the transaction has committed, receives what the caller gets
     if (this.hooks.afterUpdate) {
       const afterUpdate = this.hooks.afterUpdate;
-      runAfterCommit(tx, () => afterUpdate(result, input, context));
+      runAfterCommit(tx, () => afterUpdate(result, input, context, meta));
     }
 
     return result;
@@ -545,14 +571,17 @@ export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = 
    * Delete ${modelName}
    */
   async delete(id: string, tx: DbTransaction, options?: QueryOptions, context?: DomainHookContext<DomainEnvVars>): Promise<${modelName}> {
-    // Before-delete hook (outside transaction)
+    // A delete has no accept rules: trusted is only forwarded to the hooks
+    const meta: WriteHookMeta = { trusted: options?.trusted === true };
+
+    // Before-delete hook (in the caller's transaction)
     if (this.hooks.beforeDelete) {
-      await this.hooks.beforeDelete(id, context);
+      await this.hooks.beforeDelete(id, context, { ...meta, tx });
     }
 
     // Pre-delete hook
     if (this.hooks.preDelete) {
-      const preResult = await this.hooks.preDelete(id, tx, context);
+      const preResult = await this.hooks.preDelete(id, tx, context, meta);
       id = preResult.id;
     }
 
@@ -566,7 +595,7 @@ export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = 
     // Post-delete hook
     let result = deleted;
     if (this.hooks.postDelete) {
-      result = await this.hooks.postDelete(id, deleted, tx, context);
+      result = await this.hooks.postDelete(id, deleted, tx, context, meta);
     }
 
     // Sanitize response (strip unexposed fields) unless skipped
@@ -577,7 +606,7 @@ export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = 
     // After-delete hook: starts once the transaction has committed, receives what the caller gets
     if (this.hooks.afterDelete) {
       const afterDelete = this.hooks.afterDelete;
-      runAfterCommit(tx, () => afterDelete(result, context));
+      runAfterCommit(tx, () => afterDelete(result, context, meta));
     }
 
     return result;
