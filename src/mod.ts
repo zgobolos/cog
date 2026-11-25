@@ -137,7 +137,7 @@ export async function generateFromModels(
   }
 
   // Generate domain APIs
-  const domainGenerator = new DomainAPIGenerator(models);
+  const domainGenerator = new DomainAPIGenerator(models, { isCockroachDB: config.database.type === 'cockroachdb' });
   const domainFiles = domainGenerator.generateDomainAPIs();
   domainFiles.forEach((content, path) => files.set(path, content));
 

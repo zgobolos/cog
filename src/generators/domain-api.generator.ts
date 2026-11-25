@@ -6,9 +6,11 @@ import { capitalize, toCamelCase, toSnakeCase } from '../utils/string.utils.ts';
  */
 export class DomainAPIGenerator {
   private models: ModelDefinition[];
+  private isCockroachDB: boolean;
 
-  constructor(models: ModelDefinition[]) {
+  constructor(models: ModelDefinition[], options: { isCockroachDB?: boolean } = {}) {
     this.models = models;
+    this.isCockroachDB = options.isCockroachDB === true;
   }
 
   /**
@@ -76,6 +78,10 @@ export interface QueryOptions {
 
   // Soft-delete control (find* methods, default: false): include soft-deleted rows
   withSoftDeleted?: boolean;
+
+  // Keep given timestamps (create/createMany, default: false; honored only with trusted): a createdAt or
+  // updatedAt in the input is written instead of the default, a missing one still gets the default
+  keepTimestamps?: boolean;
 
   // Trusted write (create/update/delete, default: false): server code writing its own values. Lifts
   // the model's accept rules (accept: "never", and "create" on update); the columns COG manages -
@@ -260,7 +266,9 @@ export interface JunctionTableHooks<DomainEnvVars extends Record<string, unknown
 
     // We need inArray for batch fetching in findMany when there are relationships
     // We need AnyColumn for orderBy type casting
-    let drizzleImports = 'import { eq, desc, asc, sql, and, type AnyColumn';
+    let drizzleImports = `import { eq, desc, asc, sql, and, ${
+      this.isCockroachDB ? '' : 'getTableColumns, '
+    }type AnyColumn`;
     if (hasManyToMany || hasRelationships) {
       drizzleImports += ', inArray';
     }
@@ -293,6 +301,23 @@ const ${modelNameLower}CreateUnacceptedFields = getCreateUnacceptedFields(${mode
 const ${modelNameLower}UpdateUnacceptedFields = getUpdateUnacceptedFields(${modelNameLower}FieldMeta);
 const ${modelNameLower}TrustedCreateUnacceptedFields = getTrustedCreateUnacceptedFields(${modelNameLower}FieldMeta);
 const ${modelNameLower}TrustedUpdateUnacceptedFields = getTrustedUpdateUnacceptedFields(${modelNameLower}FieldMeta);
+// A trusted create with keepTimestamps writes a given createdAt/updatedAt; the soft-delete column stays out
+const ${modelNameLower}KeepTimestampsCreateUnacceptedFields = ${modelNameLower}TrustedCreateUnacceptedFields.filter(
+  (field) => field !== 'createdAt' && field !== 'updatedAt',
+);
+// Rows per INSERT of createMany()
+const ${modelNameLower}InsertChunkSize = ${
+      this.isCockroachDB
+        ? '1'
+        : `Math.max(1, Math.floor(65_535 / Object.keys(getTableColumns(${modelNameLower}Table)).length))`
+    };
+
+/** The create pipeline of one input, up to the INSERT */
+interface PreparedCreate<TNew> {
+  input: TNew;
+  values: TNew;
+  meta: WriteHookMeta;
+}
 
 /** The fields update() may increment (options.increment) */
 export type ${modelName}NumericField = ${this.generateNumericFieldUnion(model)};
@@ -319,10 +344,60 @@ export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = 
    * Create a new ${modelName}
    */
   async create(input: New${modelName}, tx: DbTransaction, options?: QueryOptions, context?: DomainHookContext<DomainEnvVars>): Promise<${modelName}> {
-    // Strip unaccepted fields from input (before any hooks); a trusted write keeps all but COG's own columns
+    const prepared = await this.prepareCreate(input, tx, options, context);
+    const [created] = await tx
+      .insert(${modelNameLower}Table)
+      .values(prepared.values)
+      .returning();
+    return await this.finishCreate(prepared, created, tx, options, context);
+  }
+
+  /**
+   * Create several ${modelName}s: the same as create() for each input in order, in a savepoint, but with
+   * multi-row INSERTs. Every input goes through strip, before*, validation and pre* first - so these hooks
+   * do not see the earlier rows of the batch in the database - then the rows are inserted, then post* runs
+   * per row in order and after* is queued per row. The results come back in input order.
+   */
+  async createMany(inputs: New${modelName}[], tx: DbTransaction, options?: QueryOptions, context?: DomainHookContext<DomainEnvVars>): Promise<${modelName}[]> {
+    if (inputs.length === 0) {
+      return [];
+    }
+    return await withNestedTransaction(tx, async (savepoint) => {
+      const prepared: Array<PreparedCreate<New${modelName}>> = [];
+      for (const input of inputs) {
+        prepared.push(await this.prepareCreate(input, savepoint, options, context));
+      }
+
+      // ${
+      this.isCockroachDB
+        ? 'CockroachDB does not promise RETURNING in VALUES order: one row per statement'
+        : 'At most 65 535 parameters per statement'
+    }
+      const created: ${modelName}[] = [];
+      for (let start = 0; start < prepared.length; start += ${modelNameLower}InsertChunkSize) {
+        const chunk = prepared.slice(start, start + ${modelNameLower}InsertChunkSize).map((row) => row.values);
+        created.push(...(await savepoint.insert(${modelNameLower}Table).values(chunk).returning()));
+      }
+
+      const results: ${modelName}[] = [];
+      for (const [index, row] of prepared.entries()) {
+        results.push(await this.finishCreate(row, created[index], savepoint, options, context));
+      }
+      return results;
+    });
+  }
+
+  /**
+   * The create pipeline up to the INSERT: strip, before*, validation, pre*, validation
+   */
+  private async prepareCreate(input: New${modelName}, tx: DbTransaction, options?: QueryOptions, context?: DomainHookContext<DomainEnvVars>): Promise<PreparedCreate<New${modelName}>> {
+    // Strip unaccepted fields from input (before any hooks); a trusted write keeps all but COG's own columns,
+    // and with keepTimestamps it keeps the timestamps too
     const strippedInput = stripUnacceptedFields(
       input as unknown as Record<string, unknown>,
-      options?.trusted ? ${modelNameLower}TrustedCreateUnacceptedFields : ${modelNameLower}CreateUnacceptedFields,
+      options?.trusted
+        ? (options.keepTimestamps ? ${modelNameLower}KeepTimestampsCreateUnacceptedFields : ${modelNameLower}TrustedCreateUnacceptedFields)
+        : ${modelNameLower}CreateUnacceptedFields,
     );
 
     const meta: WriteHookMeta = { trusted: options?.trusted === true };
@@ -345,18 +420,19 @@ export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = 
       processedInput = ${modelNameLower}InsertSchema.parse(processedInput) as New${modelName};
     }
 
-    // Unaccepted fields (timestamps) already stripped via stripUnacceptedFields
+    return { input, values: processedInput, meta };
+  }
 
-    // Perform create operation
-    const [created] = await tx
-      .insert(${modelNameLower}Table)
-      .values(processedInput as New${modelName})
-      .returning();
+  /**
+   * The create pipeline after the INSERT: post*, sanitization, after*
+   */
+  private async finishCreate(prepared: PreparedCreate<New${modelName}>, created: ${modelName}, tx: DbTransaction, options?: QueryOptions, context?: DomainHookContext<DomainEnvVars>): Promise<${modelName}> {
+    const { input, values, meta } = prepared;
 
     // Post-create hook (within transaction)
     let result = created;
     if (this.hooks.postCreate) {
-      result = await this.hooks.postCreate(processedInput, created, input, tx, context, meta);
+      result = await this.hooks.postCreate(values, created, input, tx, context, meta);
     }
 
     // Sanitize response (strip unexposed fields) unless skipped
