@@ -1460,3 +1460,104 @@ Deno.test('generator - trusted writes lift accept rules for server code only', a
     await cleanupModifiers();
   }
 });
+
+// 2.5.0: write-hook meta, conditional updates and increments, upsert, createMany, deleteMany
+Deno.test('generator - 2.5 write operations', async () => {
+  const note = {
+    name: 'Note',
+    tableName: 'note',
+    fields: [
+      { name: 'slug', type: 'string', maxLength: 100, primaryKey: true, required: true },
+      { name: 'code', type: 'string', maxLength: 20, unique: true },
+      { name: 'tenant', type: 'string', maxLength: 50, required: true },
+      { name: 'title', type: 'string', maxLength: 100 },
+      { name: 'views', type: 'integer', required: true, defaultValue: 0 },
+      { name: 'amount', type: 'decimal', precision: 10, scale: 2 },
+      { name: 'scores', type: 'integer', array: true },
+      { name: 'dueAt', type: 'date' },
+    ],
+    indexes: [
+      { fields: ['tenant', 'title'], unique: true },
+      { fields: ['tenant', 'code'], unique: true, where: 'code IS NOT NULL' },
+    ],
+    timestamps: true,
+    softDelete: true,
+  };
+  const read = (path: string): Promise<string> => Deno.readTextFile(`${MODIFIER_OUTPUT}/${path}`);
+
+  await cleanupModifiers();
+  try {
+    await generateWithModels([note]);
+    const hooksTypes = await read('domain/hooks.types.ts');
+    const domain = await read('domain/note.domain.ts');
+
+    // The unused BaseDomain is gone
+    await assertRejects(() => read('domain/base.domain.ts'), Deno.errors.NotFound);
+
+    // §1-§2: every write hook gets meta; the before* hooks the caller's transaction
+    for (
+      const type of ['WriteHookMeta', 'BeforeWriteHookMeta', 'UpdateOptions', 'UpsertOptions', 'UpsertResult']
+    ) {
+      assertEquals(hooksTypes.includes(`export interface ${type}`), true, type);
+    }
+    assertEquals(
+      hooksTypes.includes(
+        'beforeCreate?: (rawInput: unknown, context: DomainHookContext<DomainEnvVars> | undefined, meta: BeforeWriteHookMeta) => Promise<Record<string, unknown>>;',
+      ),
+      true,
+    );
+    assertEquals(hooksTypes.includes('NO transaction parameter'), false);
+    assertEquals((domain.match(/context, \{ \.\.\.meta, tx \}\)/g) ?? []).length, 3, 'beforeCreate/Update/Delete');
+
+    // §3: onlyIf and increment run the update in a savepoint; numeric fields exclude dates and arrays
+    assertEquals(domain.includes("export type NoteNumericField = 'views' | 'amount';"), true);
+    assertEquals(domain.includes('withNestedTransaction(tx, (savepoint) => this.updateRow('), true);
+    assertEquals(domain.includes('throw new ConditionFailedException('), true);
+    const helpers = await read('rest/helpers.ts');
+    assertEquals(
+      /if \(error instanceof ConditionFailedException\) \{\s*\n\s*throw new HTTPException\(409/.test(helpers),
+      true,
+    );
+
+    // §4: the conflict targets - primary key, unique field, unique index; not an index with its own where
+    assertEquals(
+      domain.includes(
+        "export type NoteUniqueTarget = readonly ['slug'] | readonly ['code'] | readonly ['tenant', 'title'];",
+      ),
+      true,
+    );
+    assertEquals(domain.includes(".for('update')"), true);
+    assertEquals((await read('db/database.ts')).includes('export const sqlStateOf'), true);
+
+    // §5: createMany chunks by the column count on PostgreSQL; keepTimestamps keeps the soft-delete column out
+    assertEquals(domain.includes('Math.floor(65_535 / Object.keys(getTableColumns(noteTable)).length)'), true);
+    assertEquals(domain.includes("(field) => field !== 'createdAt' && field !== 'updatedAt'"), true);
+
+    // §6: deleteMany selects through findMany, without limit, offset or include
+    assertEquals(
+      domain.includes("this.findMany(savepoint, { where, orderBy: 'slug', skipSanitization: true }, context)"),
+      true,
+    );
+    assertEquals(domain.includes('if (data.length !== total)'), true);
+
+    // The REST layer passes none of the new options
+    const factory = await read('rest/crud.factory.ts');
+    for (const option of ['onlyIf', 'increment', 'keepTimestamps', 'trusted']) {
+      assertEquals(factory.includes(option), false, option);
+    }
+  } finally {
+    await cleanupModifiers();
+  }
+
+  // CockroachDB does not promise RETURNING in VALUES order: one row per INSERT
+  try {
+    await Deno.mkdir(MODIFIER_MODELS, { recursive: true });
+    await Deno.writeTextFile(`${MODIFIER_MODELS}/note.json`, JSON.stringify(note, null, 2));
+    await generateFromModels(MODIFIER_MODELS, MODIFIER_OUTPUT, { database: { type: 'cockroachdb' } });
+    const domain = await read('domain/note.domain.ts');
+    assertEquals(domain.includes('const noteInsertChunkSize = 1;'), true);
+    assertEquals(domain.includes('getTableColumns'), false);
+  } finally {
+    await cleanupModifiers();
+  }
+});

@@ -4,9 +4,15 @@ import { Scalar } from '@scalar/hono-api-reference';
 import { load } from '@std/dotenv';
 import { crypto } from '@std/crypto';
 import { and, isNotNull, type SQL } from 'drizzle-orm';
-import { type DbTransaction, extractRoutes, initializeGenerated, type QueryOptions } from '../generated/index.ts';
+import {
+  ConditionFailedException,
+  type DbTransaction,
+  extractRoutes,
+  initializeGenerated,
+  type QueryOptions,
+} from '../generated/index.ts';
 import type { DomainHookContext } from '../generated/domain/hooks.types.ts';
-import type { Employee, NewEmployee } from '../generated/schema/index.ts';
+import type { Employee, NewEmployee, NewKeyedNote } from '../generated/schema/index.ts';
 import { employeeTable } from '../generated/schema/employee.schema.ts';
 import { buildOpenAPISpec } from '../generated/rest/openapi.ts';
 import type { ExampleEnv } from './context.ts';
@@ -361,6 +367,29 @@ export async function startServer(config: ServerConfig = {}): Promise<ServerHand
         ): Promise<QueryOptions> => {
           recordHook('skill.beforeFindMany', context);
           return Promise.resolve(options);
+        },
+      },
+
+      // The REST layer never sets options.trusted: the write hooks record what meta.trusted they get.
+      // A status of 'conflict-probe' throws ConditionFailedException from a hook during the request.
+      keyednote: {
+        beforeCreate: (rawInput, _context, meta): Promise<Record<string, unknown>> => {
+          recordHook('keyednote.beforeCreate', { trusted: meta.trusted });
+          return Promise.resolve(rawInput as Record<string, unknown>);
+        },
+        beforeUpdate: (_id, rawInput, _context, meta): Promise<Record<string, unknown>> => {
+          recordHook('keyednote.beforeUpdate', { trusted: meta.trusted });
+          return Promise.resolve(rawInput as Record<string, unknown>);
+        },
+        preUpdate: (id, input): Promise<Partial<NewKeyedNote>> => {
+          if (input.status === 'conflict-probe') {
+            return Promise.reject(new ConditionFailedException(`KeyedNote ${id} does not match the probe condition`));
+          }
+          return Promise.resolve(input);
+        },
+        beforeDelete: (_id, _context, meta): Promise<void> => {
+          recordHook('keyednote.beforeDelete', { trusted: meta.trusted });
+          return Promise.resolve();
         },
       },
     },

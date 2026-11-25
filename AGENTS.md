@@ -173,7 +173,7 @@ The `crud.factory.ts` provides generic handlers (`createListHandler`, `createGet
 
 Each model has a domain class with CRUD operations and hook orchestration:
 
-- `create()`, `findById()`, `findMany()`, `update()`, `delete()`
+- `create()`, `findById()`, `findMany()`, `update()`, `delete()`, and (2.5) `upsert()`, `createMany()`, `deleteMany()`
 - Hook flow: before → validate → pre → DB operation → post → after
 - Relationship loading via `include` parameter
 - Field sanitization (strip unexposed/unaccepted fields)
@@ -324,23 +324,55 @@ handlers, they pass the request context (`c.var`) to the domain, so junction hoo
 ## Hook System
 
 ```
-Before-hook (outside tx) → Zod validation → Begin TX → Pre-hook → Zod → DB op → Post-hook → Commit → After-hook
+(caller's TX) strip → Before-hook (meta.tx) → Zod → Pre-hook → Zod → DB op → Post-hook → Commit → After-hook
 ```
 
-| Hook           | Signature                                                | When                |
-| -------------- | -------------------------------------------------------- | ------------------- |
-| `beforeCreate` | `(rawInput, ctx?) => Promise<Record<string, unknown>>`   | Before validation   |
-| `preCreate`    | `(input, rawInput, tx, ctx?) => Promise<input>`          | Before DB operation |
-| `postCreate`   | `(input, result, rawInput, tx, ctx?) => Promise<result>` | After DB (in tx)    |
-| `afterCreate`  | `(result, rawInput, ctx?) => Promise<void>`              | After commit        |
+| Hook           | Signature                                                     | When                |
+| -------------- | ------------------------------------------------------------- | ------------------- |
+| `beforeCreate` | `(rawInput, ctx, meta) => Promise<Record<string, unknown>>`   | Before validation   |
+| `preCreate`    | `(input, rawInput, tx, ctx, meta) => Promise<input>`          | Before DB operation |
+| `postCreate`   | `(input, result, rawInput, tx, ctx, meta) => Promise<result>` | After DB (in tx)    |
+| `afterCreate`  | `(result, rawInput, ctx, meta) => Promise<void>`              | After commit        |
 
-Same pattern for `Update`, `Delete`, `FindById`, `FindMany`, and junction operations (`AddJunction`, `RemoveJunction`).
+Same pattern for `Update`, `Delete`, `FindById`, `FindMany`, and junction operations (`AddJunction`, `RemoveJunction`);
+the read and junction hooks have no `meta`.
+
+- **Write-hook meta** (2.5): `WriteHookMeta { trusted; increment? }` for `pre*`/`post*`/`after*`, and
+  `BeforeWriteHookMeta`, which adds the caller's `tx`, for `before*`. `trusted` is `options.trusted === true` of that
+  call - never inherited, never set by REST; `delete` only forwards it. `ctx` is `Ctx | undefined`, not optional, since
+  a required parameter cannot follow an optional one: a hook declaring fewer parameters compiles, code that calls hooks
+  (a composer) has to pass `meta`. Before 2.5 the `before*` hooks got no transaction although create/update/delete
+  always run in one, so a `before*` that read used `withoutTransaction()` - a second pool connection that missed the
+  rows of its own transaction and, with the pool exhausted, deadlocked.
 
 - `beforeCreate`/`beforeUpdate` receive the input after `stripUnacceptedFields`, before Zod - so they also see keys that
   are no column, which Zod drops afterwards. Their return value is the input to validate; the return type is
   `Promise<Record<string, unknown>>` (it was `Promise<unknown>`, which let a hook that forgot to return compile and fail
   validation on `undefined`).
 - The `rawInput` of `pre*`/`post*`/`after*` is the caller's original input, not the `before*` output.
+
+**Write operations (2.5)** - domain counterparts of SQL that otherwise bypassed every hook; REST passes none of their
+options. Each runs its whole pipeline in `withNestedTransaction`, so a failure also undoes its own hooks' writes and
+drops their after* hooks, and a caller may catch and carry on (they need a COG-opened transaction):
+
+- `update(…, { onlyIf, increment })` (`UpdateOptions<<Model>NumericField>`): `onlyIf` (WhereFilter through the shared
+  `toWhereSQL` helper that `findMany` uses, or SQL) joins the row condition; no row back → `rowExists` decides between
+  `ConditionFailedException` and `NotFoundException`. `increment` writes `field = field + n` for integer/bigint/decimal
+  fields (`assertIncrement` at runtime; a field set by the final input after `pre*` too is a `DomainException`). A plain
+  update still runs without a savepoint (`update` → `updateRow`).
+- `upsert(input, tx, { conflictTarget, onConflict })`: `lockByTarget` (`SELECT … FOR UPDATE`, live rows only; a missing
+  or NULL target value never conflicts) → `resolveConflict` (`'update'` = `update` without target and pk fields;
+  `'nothing'` = `findById` so read hooks apply, `null` → `NotFoundException`) or `create` in an inner savepoint; a
+  `23505` (via `sqlStateOf` in `db/database.ts`) retries the lookup once, a second propagates - a soft-deleted row
+  holding the key would loop otherwise. `<Model>UniqueTarget`: pk, unique fields, unique indexes without a `where`.
+- `createMany`: `create` is split into `prepareCreate` (strip, before*, Zod, pre*, Zod) and `finishCreate` (post*,
+  sanitize, after*); createMany prepares all, inserts in chunks of `⌊65 535 / column count⌋` (`getTableColumns`), then
+  finishes per row in input order. On CockroachDB (`DomainAPIGenerator` gets `isCockroachDB`) the chunk is 1, since its
+  `RETURNING` order of a multi-row insert is not promised. `keepTimestamps` (with `trusted` only) uses
+  `<model>KeepTimestampsCreateUnacceptedFields` - the trusted list without createdAt/updatedAt.
+- `deleteMany(where)`: selects through `findMany(savepoint, { where, orderBy: <pk>, skipSanitization: true }, context)`
+  so read hooks scope it, refuses a selection a find hook paginated (`data.length !== total`), locks the ids
+  `FOR UPDATE` in pk order (`lockLiveRows`, chunks of 10 000, vanished rows left out), then `delete()`s each.
 
 **Context**: the Hono context variables (`c.var`) the app's middleware sets with `c.set()`; the CRUD and many-to-many
 handlers pass them to every domain call, typed through the `DomainEnvVars` generic.
@@ -381,15 +413,16 @@ connections still saw the old state), ran after a rollback, and ran once per ret
 Domain layer throws `DomainException`, `NotFoundException` or `InvalidFilterException`. Zod validation (input schema
 parse) throws `ZodError`. REST layer (`handleDomainException`) converts these to HTTP status codes.
 
-| Exception                | HTTP Status |
-| ------------------------ | ----------- |
-| `NotFoundException`      | 404         |
-| `InvalidFilterException` | 400         |
-| `ZodError`               | 400         |
-| Malformed JSON body      | 400         |
-| Unique violation         | 409         |
-| Other constraint errors  | 400         |
-| `DomainException`        | 500         |
+| Exception                  | HTTP Status |
+| -------------------------- | ----------- |
+| `NotFoundException`        | 404         |
+| `InvalidFilterException`   | 400         |
+| `ConditionFailedException` | 409         |
+| `ZodError`                 | 400         |
+| Malformed JSON body        | 400         |
+| Unique violation           | 409         |
+| Other constraint errors    | 400         |
+| `DomainException`          | 500         |
 
 `ZodError` → 400 carries the Zod issues array as the message, covering all input validation failures (`minLength`,
 `maxLength`, required, enum, type). Exceptions in hooks trigger transaction rollback.

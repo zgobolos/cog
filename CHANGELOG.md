@@ -2,6 +2,38 @@
 
 Releases are git tags (`2.4.0`, no `v` prefix). Versions before 2.3.0 are described in their commit messages.
 
+## 2.5.0
+
+### Added
+
+- **Write-hook meta.** Every write hook (`before*`, `pre*`, `post*`, `after*` of create, update and delete) gets a
+  trailing `meta`: `WriteHookMeta { trusted, increment? }`, and for `before*` `BeforeWriteHookMeta`, which adds the
+  caller's `tx`. `meta.trusted` lets a guard written for client input let server code through; it is never inherited,
+  and REST never sets it. `delete()` forwards `options.trusted`.
+- **`before*` hooks get the open transaction** as `meta.tx`. They always ran inside it, but without it a `before*` that
+  read the database used a second pool connection: it missed the rows of its own transaction and, with the pool
+  exhausted, deadlocked.
+- **Conditional updates and increments:** `update(…, { onlyIf, increment })`. A row that exists but fails `onlyIf`
+  throws the new `ConditionFailedException` (REST: **409**); `increment` adds to integer, bigint and decimal fields in
+  SQL.
+- **`upsert(input, tx, { conflictTarget, onConflict })`**: find by a unique key, then create or update (or, with
+  `'nothing'`, return the row through `findById`), with every hook of the path. `conflictTarget` is typed per model.
+- **`createMany(inputs, tx)`**: `create` per input with multi-row inserts, results in input order. **`keepTimestamps`**,
+  with `trusted`, writes a given `createdAt`/`updatedAt`.
+- **`deleteMany(where, tx)`**: `delete` per matching row, the selection scoped by the read hooks and locked
+  `FOR UPDATE`, never partial.
+- Every new operation runs in a savepoint: on a failure it leaves no trace, its hooks' writes and after-hooks included.
+- `sqlStateOf(error)` in the generated `db/database.ts`.
+
+### Changed (breaking)
+
+- **Code that calls hooks** - a function composing several hook sets, a test invoking a hook - has to pass `meta`, and
+  `context` is no longer an optional parameter in the hook types. Hook implementations are not affected: one declaring
+  fewer parameters still compiles.
+- **`domain/base.domain.ts` is no longer generated.** No domain extended `BaseDomain`, `domain/index.ts` did not export
+  it, and it had no soft delete.
+- The new operations need a transaction COG opened (`withTransaction`, `withNestedTransaction`), like after-hooks do.
+
 ## 2.4.1
 
 ### Fixed

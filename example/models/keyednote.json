@@ -1,0 +1,53 @@
+{
+  "name": "KeyedNote",
+  "tableName": "keyed_note",
+  "description": "Test entity for the 2.5 write features: a non-id primary key, a composite unique index, a counter",
+  "fields": [
+    {
+      "name": "slug",
+      "type": "string",
+      "maxLength": 100,
+      "primaryKey": true,
+      "required": true,
+      "description": "Primary key that is not called id - an upsert conflict target"
+    },
+    {
+      "name": "tenant",
+      "type": "string",
+      "maxLength": 50,
+      "required": true,
+      "description": "Scope for the tenant-filtering read hooks of the tests"
+    },
+    {
+      "name": "title",
+      "type": "string",
+      "maxLength": 100
+    },
+    {
+      "name": "body",
+      "type": "text"
+    },
+    {
+      "name": "views",
+      "type": "integer",
+      "required": true,
+      "defaultValue": 0,
+      "description": "Counter for increment"
+    },
+    {
+      "name": "status",
+      "type": "string",
+      "maxLength": 20,
+      "required": true,
+      "defaultValue": "draft",
+      "description": "State for onlyIf"
+    }
+  ],
+  "indexes": [
+    {
+      "fields": ["tenant", "title"],
+      "unique": true
+    }
+  ],
+  "timestamps": true
+}

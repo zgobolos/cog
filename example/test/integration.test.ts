@@ -13,12 +13,17 @@
  */
 
 import { assert, assertEquals, assertExists, assertMatch } from '@std/assert';
-import { eq } from 'drizzle-orm';
+import { and, eq, lt, type SQL } from 'drizzle-orm';
 import {
   type AcceptanceTestEntity,
   AcceptanceTestEntityDomain,
+  AdvancedDemoDomain,
+  advanceddemoDomain,
   type Assignment,
+  ConditionFailedException,
+  type DbTransaction,
   type Department,
+  DomainException,
   type Employee,
   encodeFilter,
   type ExposureTestEntity,
@@ -27,13 +32,22 @@ import {
   getSQL,
   type IDCard,
   InvalidFilterException,
+  type KeyedNote,
+  KeyedNoteDomain,
+  keyednoteDomain,
+  keyednoteTable,
+  type NewAdvancedDemo,
+  NotFoundException,
   type Project,
   type Skill,
   SkillDomain,
   skillDomain,
+  SoftDeleteTestEntityDomain,
+  sqlStateOf,
   withNestedTransaction,
   withoutTransaction,
   withTransaction,
+  type WriteHookMeta,
 } from '../generated/index.ts';
 import { hookCalls } from '../src/hook-probe.ts';
 import { type ServerHandle, startServer } from '../src/main.ts';
@@ -1778,6 +1792,538 @@ async function runTests(): Promise<void> {
   }) as AcceptanceTestEntity;
   assertEquals(restUpdated.neverAcceptedField, 'server-generated', 'PUT does not write it');
   logSuccess('✓ Trusted writes lift accept for server code only, with every hook');
+
+  // ========================================
+  // 27. WRITE HOOK META: TRUSTED AND THE OPEN TRANSACTION
+  // ========================================
+  logSection('27. Testing the Write Hook Meta (trusted, tx)');
+
+  // Every KeyedNote of sections 27-31 starts with this prefix; the end of section 31 removes them
+  const notePrefix = `note-${crypto.randomUUID().slice(0, 8)}`;
+  let noteCount = 0;
+  const nextSlug = (label: string): string => `${notePrefix}-${label}-${++noteCount}`;
+  type TenantVars = { tenant?: string };
+
+  logStep('27.1 Every write hook receives meta.trusted');
+  const trustSeen: string[] = [];
+  const record = (hook: string, meta: WriteHookMeta): void => {
+    trustSeen.push(`${hook}:${meta.trusted}`);
+  };
+  const trustProbe = new KeyedNoteDomain<TenantVars>({
+    beforeCreate: (rawInput, _context, meta) => {
+      record('beforeCreate', meta);
+      return Promise.resolve(rawInput as Record<string, unknown>);
+    },
+    preCreate: (input, _rawInput, _tx, _context, meta) => {
+      record('preCreate', meta);
+      return Promise.resolve(input);
+    },
+    postCreate: (_input, result, _rawInput, _tx, _context, meta) => {
+      record('postCreate', meta);
+      return Promise.resolve(result);
+    },
+    afterCreate: (_result, _rawInput, _context, meta) => {
+      record('afterCreate', meta);
+      return Promise.resolve();
+    },
+    beforeUpdate: (_id, rawInput, _context, meta) => {
+      record('beforeUpdate', meta);
+      return Promise.resolve(rawInput as Record<string, unknown>);
+    },
+    preUpdate: (_id, input, _rawInput, _tx, _context, meta) => {
+      record('preUpdate', meta);
+      return Promise.resolve(input);
+    },
+    postUpdate: (_id, _input, result, _rawInput, _tx, _context, meta) => {
+      record('postUpdate', meta);
+      return Promise.resolve(result);
+    },
+    afterUpdate: (_result, _rawInput, _context, meta) => {
+      record('afterUpdate', meta);
+      return Promise.resolve();
+    },
+    beforeDelete: (_id, _context, meta) => {
+      record('beforeDelete', meta);
+      return Promise.resolve();
+    },
+    preDelete: (id, _tx, _context, meta) => {
+      record('preDelete', meta);
+      return Promise.resolve({ id });
+    },
+    postDelete: (_id, result, _tx, _context, meta) => {
+      record('postDelete', meta);
+      return Promise.resolve(result);
+    },
+    afterDelete: (_result, _context, meta) => {
+      record('afterDelete', meta);
+      return Promise.resolve();
+    },
+  });
+  const writeHooks = ['Create', 'Update', 'Delete'].flatMap((operation) =>
+    ['before', 'pre', 'post', 'after'].map((stage) => `${stage}${operation}`)
+  );
+  for (const trusted of [true, false]) {
+    trustSeen.length = 0;
+    const slug = nextSlug(`trust-${trusted}`);
+    const options = trusted ? { trusted: true } : undefined;
+    await withTransaction(async (tx) => {
+      await trustProbe.create({ slug, tenant: 'a' }, tx, options);
+      await trustProbe.update(slug, { body: 'changed' }, tx, options);
+      await trustProbe.delete(slug, tx, options);
+    });
+    await waitUntil(() => trustSeen.includes('afterDelete:' + trusted), `after* hooks with trusted ${trusted}`);
+    assertEquals(trustSeen.toSorted(), writeHooks.map((hook) => `${hook}:${trusted}`).toSorted());
+  }
+
+  logStep("27.2 A hook's own domain call without options sees trusted false");
+  const nestedTrust: boolean[] = [];
+  const innerProbe = new KeyedNoteDomain({
+    beforeUpdate: (_id, rawInput, _context, meta) => {
+      nestedTrust.push(meta.trusted);
+      return Promise.resolve(rawInput as Record<string, unknown>);
+    },
+  });
+  const outerProbe = new KeyedNoteDomain({
+    postCreate: async (_input, result, _rawInput, tx) => {
+      await innerProbe.update(result.slug, { body: 'written by a hook' }, tx);
+      return result;
+    },
+  });
+  const nestedSlug = nextSlug('nested');
+  await withTransaction((tx) => outerProbe.create({ slug: nestedSlug, tenant: 'a' }, tx, { trusted: true }));
+  assertEquals(nestedTrust, [false], 'trusted is not inherited');
+
+  logStep('27.3 REST POST, PUT and DELETE pass trusted false');
+  hookCalls.length = 0;
+  const restSlug = nextSlug('rest');
+  await POST('/api/keyednote', { slug: restSlug, tenant: 'a' });
+  await PUT(`/api/keyednote/${restSlug}`, { body: 'over REST' });
+  await DELETE(`/api/keyednote/${restSlug}`);
+  for (const hook of ['keyednote.beforeCreate', 'keyednote.beforeUpdate', 'keyednote.beforeDelete']) {
+    assertEquals(hookCalls.find((call) => call.hook === hook)?.context?.trusted, false, hook);
+  }
+
+  logStep('27.4 before* reads through meta.tx a row this uncommitted transaction created');
+  const seenThroughTx: Record<string, number> = {};
+  const seenOutside: Record<string, number> = {};
+  const countRows = async (slug: string, tx: DbTransaction, hook: string): Promise<void> => {
+    seenThroughTx[hook] = (await tx.select().from(keyednoteTable).where(eq(keyednoteTable.slug, slug))).length;
+    seenOutside[hook] =
+      (await withoutTransaction().select().from(keyednoteTable).where(eq(keyednoteTable.slug, slug))).length;
+  };
+  const txProbe = new KeyedNoteDomain({
+    beforeUpdate: async (id, rawInput, _context, meta) => {
+      await countRows(id, meta.tx, 'beforeUpdate');
+      return rawInput as Record<string, unknown>;
+    },
+    beforeDelete: async (id, _context, meta) => {
+      await countRows(id, meta.tx, 'beforeDelete');
+    },
+  });
+  await withTransaction(async (tx) => {
+    const slug = nextSlug('uncommitted');
+    await txProbe.create({ slug, tenant: 'a' }, tx);
+    await txProbe.update(slug, { body: 'still uncommitted' }, tx);
+    await txProbe.delete(slug, tx);
+  });
+  assertEquals(seenThroughTx, { beforeUpdate: 1, beforeDelete: 1 }, 'meta.tx sees the uncommitted row');
+  assertEquals(seenOutside, { beforeUpdate: 0, beforeDelete: 0 }, 'a second connection does not');
+
+  logStep('27.5 A pool of one: a REST update whose beforeUpdate reads through meta.tx completes');
+  const poolOfOne = await new Deno.Command(Deno.execPath(), {
+    args: ['run', '-A', new URL('./pool-of-one.ts', import.meta.url).pathname],
+    stdout: 'piped',
+    stderr: 'piped',
+  }).output();
+  assertEquals(poolOfOne.code, 0, new TextDecoder().decode(poolOfOne.stderr));
+  logSuccess('✓ Write hooks see trusted and the open transaction');
+
+  // ========================================
+  // 28. CONDITIONAL UPDATE AND INCREMENT
+  // ========================================
+  logSection('28. Testing Conditional Updates and Increments (onlyIf, increment)');
+
+  const conditionHooks: string[] = [];
+  const conditionProbe = new KeyedNoteDomain({
+    preUpdate: async (_id, input, _rawInput, tx) => {
+      conditionHooks.push('preUpdate');
+      // A write of the hook itself: the savepoint has to undo it when the condition fails
+      if (input.body === 'with a side effect') {
+        await keyednoteDomain.create({ slug: `${notePrefix}-side-effect`, tenant: 'a' }, tx);
+      }
+      return input;
+    },
+    postUpdate: (_id, _input, result) => {
+      conditionHooks.push('postUpdate');
+      return Promise.resolve(result);
+    },
+    afterUpdate: () => {
+      conditionHooks.push('afterUpdate');
+      return Promise.resolve();
+    },
+  });
+  const conditionSlug = nextSlug('condition');
+  await withTransaction((tx) => keyednoteDomain.create({ slug: conditionSlug, tenant: 'a' }, tx));
+
+  logStep('28.1 onlyIf that matches updates the row');
+  const published = await withTransaction((tx) =>
+    conditionProbe.update(conditionSlug, { status: 'published' }, tx, {
+      onlyIf: { field: 'status', op: 'eq', value: 'draft' },
+    })
+  );
+  assertEquals(published.status, 'published');
+  // Its afterUpdate starts after COMMIT, not awaited: let it land before the list is reset for 28.2
+  await waitUntil(() => conditionHooks.includes('afterUpdate'), 'afterUpdate of 28.1');
+
+  logStep('28.2 onlyIf that does not match: ConditionFailedException, the row unchanged, no post* or after*');
+  conditionHooks.length = 0;
+  const notDraft = await withTransaction((tx) =>
+    conditionProbe.update(conditionSlug, { status: 'archived' }, tx, {
+      onlyIf: { field: 'status', op: 'eq', value: 'draft' },
+    })
+  ).catch((error: unknown) => error);
+  assert(notDraft instanceof ConditionFailedException, 'a row that does not match raises ConditionFailedException');
+  assertEquals((await keyednoteDomain.findById(conditionSlug))?.status, 'published', 'the row is unchanged');
+  await sleep(200);
+  assertEquals(conditionHooks, ['preUpdate'], 'post* and after* do not run');
+
+  logStep('28.3 onlyIf on a missing row: NotFoundException');
+  const missing = await withTransaction((tx) =>
+    conditionProbe.update(`${notePrefix}-missing`, { status: 'archived' }, tx, {
+      onlyIf: { field: 'status', op: 'eq', value: 'draft' },
+    })
+  ).catch((error: unknown) => error);
+  assert(missing instanceof NotFoundException, 'a missing row raises NotFoundException');
+
+  logStep('28.4 The caller catches the failure and commits: the hook writes are gone with the savepoint');
+  conditionHooks.length = 0;
+  await withTransaction(async (tx) => {
+    const failed = await conditionProbe.update(conditionSlug, { body: 'with a side effect' }, tx, {
+      onlyIf: eq(keyednoteTable.status, 'draft'),
+    }).catch((error: unknown) => error);
+    assert(failed instanceof ConditionFailedException, 'the condition fails');
+  });
+  assertEquals(await keyednoteDomain.findById(`${notePrefix}-side-effect`), null, "pre*'s row was rolled back");
+  await sleep(200);
+  assertEquals(conditionHooks, ['preUpdate'], 'no after* hook ran');
+
+  logStep('28.5 onlyIf on a hidden field: the WhereFilter form is refused, the SQL form works');
+  const hiddenProbe = await POST('/api/exposuretestentity', {
+    normalField: 'onlyIf probe',
+    hiddenField: 'secret',
+  }) as ExposureTestEntity;
+  const hiddenFilter = await withTransaction((tx) =>
+    exposuretestentityDomain.update(hiddenProbe.id, { normalField: 'changed' }, tx, {
+      onlyIf: { field: 'hiddenField', op: 'eq', value: 'secret' },
+    })
+  ).catch((error: unknown) => error);
+  assert(hiddenFilter instanceof InvalidFilterException, 'a hidden field is refused in a WhereFilter');
+  const hiddenSql = await withTransaction((tx) =>
+    exposuretestentityDomain.update(hiddenProbe.id, { normalField: 'changed' }, tx, {
+      onlyIf: eq(exposuretestentityTable.hiddenField, 'secret'),
+    })
+  );
+  assertEquals(hiddenSql.normalField, 'changed', 'the SQL form applies');
+  await DELETE(`/api/exposuretestentity/${hiddenProbe.id}`);
+
+  logStep('28.6 Two parallel increments add up');
+  const counterSlug = nextSlug('counter');
+  await withTransaction((tx) => keyednoteDomain.create({ slug: counterSlug, tenant: 'a' }, tx));
+  await Promise.all(
+    [1, 2].map(() => withTransaction((tx) => keyednoteDomain.update(counterSlug, {}, tx, { increment: { views: 1 } }))),
+  );
+  assertEquals((await keyednoteDomain.findById(counterSlug))?.views, 2, 'both increments are counted');
+
+  logStep('28.7 increment with onlyIf stops at the limit');
+  for (let attempt = 0; attempt < 5; attempt++) {
+    await withTransaction((tx) =>
+      keyednoteDomain.update(counterSlug, {}, tx, { increment: { views: 1 }, onlyIf: lt(keyednoteTable.views, 4) })
+    ).catch((error: unknown) => {
+      assert(error instanceof ConditionFailedException, 'past the limit the condition fails');
+    });
+  }
+  assertEquals((await keyednoteDomain.findById(counterSlug))?.views, 4, 'the counter stopped at 4');
+
+  logStep('28.8 increment of a non-numeric field, or of a field the input also sets, is refused');
+  const notNumeric = await withTransaction((tx) =>
+    keyednoteDomain.update(counterSlug, {}, tx, { increment: { status: 1 } as never })
+  ).catch((error: unknown) => error);
+  assert(notNumeric instanceof DomainException, 'a non-numeric field is refused');
+  const bothWays = await withTransaction((tx) =>
+    keyednoteDomain.update(counterSlug, { views: 10 }, tx, { increment: { views: 1 } })
+  ).catch((error: unknown) => error);
+  assert(bothWays instanceof DomainException, 'set and incremented at once is refused');
+  assertEquals((await keyednoteDomain.findById(counterSlug))?.views, 4, 'neither changed the row');
+
+  logStep('28.9 REST: a ConditionFailedException thrown by a hook answers 409');
+  const conflict = await REQUEST('PUT', `/api/keyednote/${counterSlug}`, { status: 'conflict-probe' });
+  assertEquals(conflict.status, 409);
+  logSuccess('✓ Conditional updates and increments are atomic and leave no trace when they fail');
+
+  // ========================================
+  // 29. UPSERT
+  // ========================================
+  logSection('29. Testing Upsert');
+
+  const upsertHooks: string[] = [];
+  const upsertProbe = new KeyedNoteDomain<TenantVars>({
+    beforeCreate: async (rawInput) => {
+      upsertHooks.push('beforeCreate');
+      // Wide enough for two concurrent upserts to both miss the row (29.6)
+      if ((rawInput as Record<string, unknown>).body === 'race') {
+        await sleep(150);
+      }
+      return rawInput as Record<string, unknown>;
+    },
+    afterCreate: (result) => {
+      upsertHooks.push(`afterCreate:${result.slug}`);
+      return Promise.resolve();
+    },
+    beforeUpdate: (_id, rawInput) => {
+      upsertHooks.push('beforeUpdate');
+      return Promise.resolve(rawInput as Record<string, unknown>);
+    },
+    // The tenant filter of a read: a row of another tenant is not there
+    postFindById: (_id, result, _tx, context) => {
+      upsertHooks.push('postFindById');
+      return Promise.resolve(result && context?.tenant && result.tenant !== context.tenant ? null : result);
+    },
+  });
+  const bySlug = { conflictTarget: ['slug'] as const };
+  const upsertSlug = nextSlug('upsert');
+
+  logStep('29.1 A new row is created through the create hooks');
+  upsertHooks.length = 0;
+  const created = await withTransaction((tx) =>
+    upsertProbe.upsert({ slug: upsertSlug, tenant: 'a', body: 'first' }, tx, { ...bySlug, onConflict: 'update' })
+  );
+  assertEquals(created.outcome, 'created');
+  assert(upsertHooks.includes('beforeCreate') && !upsertHooks.includes('beforeUpdate'), 'only create hooks ran');
+  // Its afterCreate starts after COMMIT, not awaited: let it land before the list is reset for 29.2
+  await waitUntil(() => upsertHooks.includes(`afterCreate:${upsertSlug}`), 'afterCreate of 29.1');
+
+  logStep("29.2 An existing row with 'update' goes through the update hooks");
+  upsertHooks.length = 0;
+  const updated = await withTransaction((tx) =>
+    upsertProbe.upsert({ slug: upsertSlug, tenant: 'a', body: 'second' }, tx, { ...bySlug, onConflict: 'update' })
+  );
+  assertEquals([updated.outcome, updated.row.body], ['updated', 'second']);
+  assertEquals(upsertHooks, ['beforeUpdate'], 'only update hooks ran');
+
+  logStep("29.3 An existing row with 'nothing' is read through findById, unchanged");
+  upsertHooks.length = 0;
+  const unchanged = await withTransaction((tx) =>
+    upsertProbe.upsert({ slug: upsertSlug, tenant: 'a', body: 'third' }, tx, { ...bySlug, onConflict: 'nothing' }, {
+      tenant: 'a',
+    })
+  );
+  assertEquals([unchanged.outcome, unchanged.row.body], ['unchanged', 'second']);
+  assertEquals(upsertHooks, ['postFindById'], 'the read hooks ran, no write hook');
+
+  logStep("29.4 'nothing' on a row a read hook hides (another tenant): NotFoundException");
+  const hidden = await withTransaction((tx) =>
+    upsertProbe.upsert({ slug: upsertSlug, tenant: 'b' }, tx, { ...bySlug, onConflict: 'nothing' }, { tenant: 'b' })
+  ).catch((error: unknown) => error);
+  assert(hidden instanceof NotFoundException, 'a row the caller may not see is not returned');
+
+  logStep('29.5 A composite unique target');
+  const titled = { tenant: `${notePrefix}-t`, title: 'composite' };
+  const byTitle = { conflictTarget: ['tenant', 'title'] as const, onConflict: 'update' as const };
+  const firstTitled = await withTransaction((tx) =>
+    upsertProbe.upsert({ ...titled, slug: nextSlug('titled'), body: 'one' }, tx, byTitle)
+  );
+  const secondTitled = await withTransaction((tx) =>
+    upsertProbe.upsert({ ...titled, slug: nextSlug('titled'), body: 'two' }, tx, byTitle)
+  );
+  assertEquals([firstTitled.outcome, secondTitled.outcome], ['created', 'updated']);
+  assertEquals(secondTitled.row.slug, firstTitled.row.slug, 'the second upsert updated the first row');
+
+  logStep("29.6 Two concurrent upserts of one key: one creates, the other updates, the loser's after* is dropped");
+  upsertHooks.length = 0;
+  const raceSlug = nextSlug('race');
+  const outcomes = await Promise.all(
+    [1, 2].map(() =>
+      withTransaction((tx) =>
+        upsertProbe.upsert({ slug: raceSlug, tenant: 'a', body: 'race' }, tx, { ...bySlug, onConflict: 'update' })
+      )
+    ),
+  );
+  assertEquals(outcomes.map((result) => result.outcome).toSorted(), ['created', 'updated']);
+  await sleep(300);
+  assertEquals(upsertHooks.filter((hook) => hook === `afterCreate:${raceSlug}`).length, 1, 'one afterCreate');
+
+  logStep('29.7 A soft-deleted row holding the key: the unique violation propagates after one retry');
+  const softDeleted = await POST('/api/softdeletetestentity', {
+    code: `UPS-${crypto.randomUUID().slice(0, 8)}`,
+    name: 'upsert probe',
+  }) as { id: string; code: string };
+  await DELETE(`/api/softdeletetestentity/${softDeleted.id}`);
+  const loop = await withTransaction((tx) =>
+    new SoftDeleteTestEntityDomain().upsert({ id: softDeleted.id, code: softDeleted.code, name: 'again' }, tx, {
+      conflictTarget: ['id'],
+      onConflict: 'update',
+    })
+  ).catch((error: unknown) => error);
+  assertEquals(sqlStateOf(loop), '23505', 'a unique violation, not an endless loop');
+  logSuccess('✓ Upsert takes the create or the update path with all its hooks');
+
+  // ========================================
+  // 30. CREATEMANY AND KEEPTIMESTAMPS
+  // ========================================
+  logSection('30. Testing createMany and keepTimestamps');
+
+  logStep('30.1 Every pre* runs before the insert, post* after it, results in input order');
+  const batchHooks: string[] = [];
+  const batchProbe = new KeyedNoteDomain({
+    preCreate: (input) => {
+      batchHooks.push(`pre:${input.slug}`);
+      return Promise.resolve(input);
+    },
+    postCreate: (_input, result) => {
+      batchHooks.push(`post:${result.slug}`);
+      return Promise.resolve(result);
+    },
+  });
+  const batchSlugs = [nextSlug('batch'), nextSlug('batch'), nextSlug('batch')];
+  const batch = await withTransaction((tx) =>
+    batchProbe.createMany(batchSlugs.map((slug) => ({ slug, tenant: 'a' })), tx)
+  );
+  assertEquals(batch.map((row) => row.slug), batchSlugs, 'results in input order');
+  assertEquals(batchHooks, [...batchSlugs.map((slug) => `pre:${slug}`), ...batchSlugs.map((slug) => `post:${slug}`)]);
+
+  logStep('30.2 An empty array returns [] without SQL');
+  assertEquals(await withTransaction((tx) => batchProbe.createMany([], tx)), []);
+
+  // advanced_demo has 15 columns: 65 535 / 15 = 4 369 rows per INSERT
+  const chunkRows = 4_370;
+  const demoName = `createMany-${crypto.randomUUID().slice(0, 8)}`;
+  const demoRow = (index: number): NewAdvancedDemo => ({
+    name: demoName,
+    optionalField1: `row ${index}`,
+    optionalField2: index,
+  });
+
+  logStep('30.3 More rows than one INSERT holds');
+  const many = await withTransaction((tx) =>
+    advanceddemoDomain.createMany(Array.from({ length: chunkRows }, (_, index) => demoRow(index)), tx)
+  );
+  assertEquals(many.length, chunkRows);
+  assertEquals(many.map((row) => row.optionalField2), Array.from({ length: chunkRows }, (_, index) => index));
+  await rawSql`DELETE FROM analytics.advanced_demo WHERE name = ${demoName}`;
+
+  logStep('30.4 A failure in the second INSERT: the caller catches and commits, no row and no after* is left');
+  let demoAfterCreates = 0;
+  const demoProbe = new AdvancedDemoDomain({
+    afterCreate: () => {
+      demoAfterCreates++;
+      return Promise.resolve();
+    },
+  });
+  await withTransaction(async (tx) => {
+    // The last row sets all three optional fields: the check constraint wants exactly two
+    const rows = Array.from({ length: chunkRows }, (_, index) => demoRow(index));
+    rows[chunkRows - 1] = { ...demoRow(chunkRows - 1), optionalField3: true };
+    const failed = await demoProbe.createMany(rows, tx).catch((error: unknown) => error);
+    assertEquals(sqlStateOf(failed), '23514', 'the check constraint fails the second INSERT');
+  });
+  const leftover = await rawSql`SELECT count(*)::int AS count FROM analytics.advanced_demo WHERE name = ${demoName}`;
+  assertEquals(leftover[0].count, 0, 'the first INSERT was rolled back with the savepoint');
+  await sleep(200);
+  assertEquals(demoAfterCreates, 0, 'no after* hook ran');
+
+  logStep('30.5 keepTimestamps writes a given createdAt with trusted, and is ignored without it');
+  const backdated = Date.UTC(2026, 10, 1, 3, 0, 0);
+  const [keptSlug, ignoredSlug] = [nextSlug('backdated'), nextSlug('backdated')];
+  const [kept] = await withTransaction((tx) =>
+    keyednoteDomain.createMany([{ slug: keptSlug, tenant: 'a', createdAt: backdated }], tx, {
+      trusted: true,
+      keepTimestamps: true,
+    })
+  );
+  const ignored = await withTransaction((tx) =>
+    keyednoteDomain.create({ slug: ignoredSlug, tenant: 'a', createdAt: backdated }, tx, { keepTimestamps: true })
+  );
+  assertEquals(kept.createdAt, backdated, 'trusted + keepTimestamps writes createdAt');
+  assert(ignored.createdAt !== backdated, 'without trusted the default wins');
+  logSuccess('✓ createMany keeps the per-row hooks, the input order and its all-or-nothing savepoint');
+
+  // ========================================
+  // 31. DELETEMANY
+  // ========================================
+  logSection('31. Testing deleteMany');
+
+  const deleteHooks: string[] = [];
+  const deleteProbe = new KeyedNoteDomain<TenantVars>({
+    // The tenant filter of a read: the selection only has the caller's rows
+    beforeFindMany: (options, context) =>
+      Promise.resolve(
+        context?.tenant
+          ? { ...options, where: and(options.where as SQL | undefined, eq(keyednoteTable.tenant, context.tenant)) }
+          : options,
+      ),
+    beforeDelete: (id) => {
+      deleteHooks.push(id);
+      if (id.endsWith('-refuse')) {
+        return Promise.reject(new Error(`refusing to delete ${id}`));
+      }
+      return Promise.resolve();
+    },
+  });
+  // A group is marked by body: (tenant, title) is unique, so title cannot be shared within a group
+  const group = (name: string): string => `${notePrefix}-group-${name}`;
+  const createGroup = (name: string, slugs: string[], tenant = 'a'): Promise<KeyedNote[]> =>
+    withTransaction((tx) => keyednoteDomain.createMany(slugs.map((slug) => ({ slug, tenant, body: name })), tx));
+  const inGroup = (name: string) => ({ field: 'body', op: 'eq', value: name } as const);
+  const countGroup = async (name: string): Promise<number> =>
+    (await keyednoteDomain.findMany(undefined, { where: inGroup(name) })).total;
+
+  logStep('31.1 Every matching row is deleted through the per-row hooks');
+  await createGroup(group('one'), [1, 2, 3].map(() => nextSlug('one')));
+  deleteHooks.length = 0;
+  const deletedRows = await withTransaction((tx) => deleteProbe.deleteMany(inGroup(group('one')), tx));
+  assertEquals(deletedRows.length, 3);
+  assertEquals(deleteHooks.length, 3, 'beforeDelete ran per row');
+  assertEquals(await countGroup(group('one')), 0);
+
+  logStep('31.2 A beforeDelete throw on row 3: the caller catches and commits, nothing is deleted');
+  const refused = [nextSlug('two'), nextSlug('two'), `${nextSlug('two')}-refuse`, nextSlug('two')];
+  await createGroup(group('two'), refused);
+  await withTransaction(async (tx) => {
+    const failed = await deleteProbe.deleteMany(inGroup(group('two')), tx).catch((error: unknown) => error);
+    assert(failed instanceof Error && failed.message.startsWith('refusing'), 'the hook error surfaces');
+  });
+  assertEquals(await countGroup(group('two')), 4, 'the rows deleted before the throw are back');
+
+  logStep('31.3 An empty match returns []');
+  assertEquals(await withTransaction((tx) => deleteProbe.deleteMany(inGroup(group('none')), tx)), []);
+
+  logStep('31.4 A row a read hook hides (another tenant) is neither selected nor deleted');
+  await createGroup(group('tenants'), [nextSlug('tenant-a')], 'a');
+  await createGroup(group('tenants'), [nextSlug('tenant-b')], 'b');
+  const tenantA = await withTransaction((tx) =>
+    deleteProbe.deleteMany(inGroup(group('tenants')), tx, undefined, { tenant: 'a' })
+  );
+  assertEquals(tenantA.map((row) => row.tenant), ['a']);
+  assertEquals(await countGroup(group('tenants')), 1, "tenant b's row is still there");
+
+  logStep('31.5 More matching rows than any page: all of them are deleted');
+  await createGroup(group('large'), Array.from({ length: 25 }, () => nextSlug('large')));
+  const large = await withTransaction((tx) => deleteProbe.deleteMany(inGroup(group('large')), tx));
+  assertEquals(large.length, 25);
+  assertEquals(await countGroup(group('large')), 0);
+
+  logStep('31.6 A find hook that paginates the selection is refused');
+  const paginating = new KeyedNoteDomain({
+    beforeFindMany: (options) => Promise.resolve({ ...options, limit: 1 }),
+  });
+  const paginated = await withTransaction((tx) => paginating.deleteMany(inGroup(group('two')), tx)).catch(
+    (error: unknown) => error,
+  );
+  assert(paginated instanceof DomainException, 'a partial selection is an error, not a partial delete');
+  assertEquals(await countGroup(group('two')), 4);
+
+  await rawSql`DELETE FROM keyed_note WHERE slug LIKE ${notePrefix + '%'} OR tenant LIKE ${notePrefix + '%'}`;
+  logSuccess('✓ deleteMany deletes the whole scoped selection through the per-row hooks, or nothing');
 
   // ========================================
   // SUCCESS

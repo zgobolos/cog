@@ -725,13 +725,16 @@ helpers are all exported from `generated/index.ts`.
 
 ### Methods
 
-| Method                                      | Returns            | Notes                                                                            |
-| ------------------------------------------- | ------------------ | -------------------------------------------------------------------------------- |
-| `create(input, tx, options?, context?)`     | the created row    | `tx` is required                                                                 |
-| `findById(id, tx?, options?, context?)`     | the row, or `null` |                                                                                  |
-| `findMany(tx?, options?, context?)`         | `{ data, total }`  | `total` counts every match, regardless of `limit` and `offset`                   |
-| `update(id, input, tx, options?, context?)` | the updated row    | `input` is partial; throws `NotFoundException` for a missing or soft-deleted row |
-| `delete(id, tx, options?, context?)`        | the deleted row    | soft-deletes on a soft-delete model; throws `NotFoundException`                  |
+| Method                                       | Returns            | Notes                                                                            |
+| -------------------------------------------- | ------------------ | -------------------------------------------------------------------------------- |
+| `create(input, tx, options?, context?)`      | the created row    | `tx` is required                                                                 |
+| `findById(id, tx?, options?, context?)`      | the row, or `null` |                                                                                  |
+| `findMany(tx?, options?, context?)`          | `{ data, total }`  | `total` counts every match, regardless of `limit` and `offset`                   |
+| `update(id, input, tx, options?, context?)`  | the updated row    | `input` is partial; throws `NotFoundException` for a missing or soft-deleted row |
+| `delete(id, tx, options?, context?)`         | the deleted row    | soft-deletes on a soft-delete model; throws `NotFoundException`                  |
+| `upsert(input, tx, options, context?)`       | `{ row, outcome }` | see [Upsert](#upsert)                                                            |
+| `createMany(inputs, tx, options?, context?)` | the created rows   | see [createMany](#createmany)                                                    |
+| `deleteMany(where, tx, options?, context?)`  | the deleted rows   | see [deleteMany](#deletemany)                                                    |
 
 A many-to-many relation adds methods named after it. For `skillList` on `Employee`, targeting `Skill`:
 
@@ -771,16 +774,19 @@ const withBooks = await authorDomain.findById(author.id, undefined, { include: [
 
 ### Query options
 
-| Option             | Methods                | Meaning                                                                                 |
-| ------------------ | ---------------------- | --------------------------------------------------------------------------------------- |
-| `where`            | `findMany`             | a [filter](#filtering) object, or a drizzle `SQL` condition                             |
-| `limit`, `offset`  | `findMany`             | pagination; no limit by default (the REST API defaults to 10)                           |
-| `orderBy`          | `findMany`             | a field name (camelCase); an unknown field is ignored                                   |
-| `orderDirection`   | `findMany`             | `'asc'` (default) or `'desc'`                                                           |
-| `include`          | `findById`, `findMany` | relation names to load                                                                  |
-| `skipSanitization` | all                    | return hidden and create-only fields too                                                |
-| `withSoftDeleted`  | `findById`, `findMany` | include soft-deleted rows                                                               |
-| `trusted`          | `create`, `update`     | write `accept`-restricted fields — see [Trusted writes](#field-exposure-and-acceptance) |
+| Option             | Methods                | Meaning                                                                                                                           |
+| ------------------ | ---------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `where`            | `findMany`             | a [filter](#filtering) object, or a drizzle `SQL` condition                                                                       |
+| `limit`, `offset`  | `findMany`             | pagination; no limit by default (the REST API defaults to 10)                                                                     |
+| `orderBy`          | `findMany`             | a field name (camelCase); an unknown field is ignored                                                                             |
+| `orderDirection`   | `findMany`             | `'asc'` (default) or `'desc'`                                                                                                     |
+| `include`          | `findById`, `findMany` | relation names to load                                                                                                            |
+| `skipSanitization` | all                    | return hidden and create-only fields too                                                                                          |
+| `withSoftDeleted`  | `findById`, `findMany` | include soft-deleted rows                                                                                                         |
+| `trusted`          | the write methods      | write `accept`-restricted fields — see [Trusted writes](#field-exposure-and-acceptance); the write hooks see it as `meta.trusted` |
+| `onlyIf`           | `update`               | update only if the row matches — see [Conditional updates](#conditional-updates-and-increments)                                   |
+| `increment`        | `update`               | add to numeric fields in SQL — see [Conditional updates](#conditional-updates-and-increments)                                     |
+| `keepTimestamps`   | `create`, `createMany` | with `trusted`: write a given `createdAt`/`updatedAt` — see [createMany](#createmany)                                             |
 
 - **Includes go through the related model's domain.** Its find hooks run with the same `context` — so a hook that scopes
   reads, by tenant for instance, scopes included rows as well — and its exposure and soft-delete rules apply.
@@ -790,6 +796,92 @@ const withBooks = await authorDomain.findById(author.id, undefined, { include: [
   not support, or a value of the wrong shape throws an `InvalidFilterException` — answered with **400** over REST —
   instead of being dropped, which would widen the result. To filter on a hidden column, pass SQL:
   `where: eq(bookTable.internalCode, code)`.
+
+### Conditional updates, upsert and batch writes
+
+These are the domain counterparts of SQL a server would otherwise write with Drizzle directly, bypassing every hook. The
+generated REST API uses none of them. Each runs its whole pipeline in a savepoint (`withNestedTransaction`): it
+completes, or it leaves no trace — on a throw, what its own `before*` and `pre*` hooks wrote, the rows it already
+inserted or deleted, and its queued `after*` hooks are all gone. So a caller may catch the error and carry on, which is
+the natural pattern for a one-time token. They therefore need a transaction COG opened.
+
+#### Conditional updates and increments
+
+`onlyIf` adds a condition to the row's `UPDATE … WHERE`; `increment` adds to numeric fields in SQL. Together they
+replace a read-then-write that races:
+
+```typescript
+import { attemptDomain, attemptTable, tokenDomain, withTransaction } from './generated/index.ts';
+import { lt } from 'drizzle-orm';
+
+// Consume a one-time token: only if nobody consumed it first
+await withTransaction((tx) =>
+  tokenDomain.update(id, { usedAt: Date.now() }, tx, {
+    trusted: true,
+    onlyIf: { field: 'usedAt', op: 'isNull', value: true },
+  })
+);
+
+// Count a guess, at most five
+await withTransaction((tx) =>
+  attemptDomain.update(id, {}, tx, { increment: { attempts: 1 }, onlyIf: lt(attemptTable.attempts, 5) })
+);
+```
+
+- **`onlyIf`** is a filter object — validated like a `findMany` filter, so a hidden field needs the SQL form — or an SQL
+  condition. A row that exists but does not match throws `ConditionFailedException` (the REST API answers **409**, for
+  one thrown during a request); a missing or soft-deleted row throws `NotFoundException`. `post*` and `after*` do not
+  run on a failure.
+- **`increment`** takes `integer`, `bigint` and `decimal` fields — typed per model as `<Model>NumericField`, and checked
+  at runtime. A field may not be both set by the input and incremented; that is checked after `pre*`, and refused with a
+  `DomainException`. `before*` and `pre*` see the increment as `meta.increment`; `post*` and `after*` get the computed
+  value. A `decimal` comes back as a string, like every `decimal`.
+
+#### Upsert
+
+```typescript
+const { row, outcome } = await withTransaction((tx) =>
+  attachmentmetaDomain.upsert({ attachmentId, text }, tx, { conflictTarget: ['attachmentId'], onConflict: 'update' })
+);
+// outcome: 'created' | 'updated' | 'unchanged'
+```
+
+It means "find by the key, then create or update", with every hook of the path taken:
+
+1. The row is read by the `conflictTarget` values, `FOR UPDATE`; soft-deleted rows are not seen, as in every read.
+2. Found: `'update'` runs `update` on it without the target and primary key fields — `accept` rules as on update — and
+   `'nothing'` returns it through `findById`, so the read hooks decide whether the caller sees it: a row they hide
+   (another tenant) throws `NotFoundException`.
+3. Not found: `create` runs in an inner savepoint. If a concurrent writer created the row in between, the unique
+   violation sends the upsert back to step 1, once; a second violation propagates — a soft-deleted row holding the key
+   is never found, and would loop for ever. On CockroachDB the race usually surfaces as a serialization error instead,
+   and `withTransaction` retries the whole transaction.
+
+`conflictTarget` is typed per model as `<Model>UniqueTarget`: the primary key, every unique field, and every unique
+index — `['tenant', 'title']` — except one declared with a `where` of its own.
+
+#### createMany
+
+`createMany(inputs, tx)` is `create` for each input in order, with multi-row `INSERT`s: first strip, `before*`,
+validation and `pre*` for every input, then the inserts — at most 65 535 / column count rows each — then `post*` per row
+in order, with `after*` queued per row. The results come back in input order; an empty array returns `[]` without SQL. A
+`before*` or `pre*` hook does not see the earlier rows of the batch in the database. On CockroachDB, which does not
+promise `RETURNING` in `VALUES` order, every row is an `INSERT` of its own.
+
+Even a trusted create leaves `createdAt` and `updatedAt` to the database. Backdated data passes `keepTimestamps: true`
+together with `trusted: true`: a timestamp present in the input is written, a missing one still gets the default, and
+the soft-delete column stays stripped.
+
+#### deleteMany
+
+`deleteMany(where, tx)` is `delete` for every matching row, with every hook per row; it takes `trusted` like `delete`.
+
+- The rows are selected through `findMany`, so its read hooks scope the selection — a tenant filter keeps out the rows
+  of other tenants. There is no limit, offset or include, and a find hook that limits the selection anyway is refused
+  with a `DomainException`: `deleteMany` never deletes part of its match silently.
+- The selected rows are locked `FOR UPDATE` in primary key order. A row deleted elsewhere in between is left out instead
+  of failing the call halfway.
+- A `before*` or `pre*` throw aborts the call, and the savepoint restores the rows already deleted.
 
 ### Transactions
 
@@ -845,15 +937,15 @@ Hooks add behavior around every domain operation without touching generated code
 withTransaction opens the transaction            (the REST API does this before calling the domain)
   create()
     remove the fields the model does not accept on create
-    beforeCreate(rawInput)                        no transaction handle, before validation
+    beforeCreate(rawInput, context, meta)         in the transaction (meta.tx), before validation
     validate with the Zod insert schema
-    preCreate(input, rawInput, tx)                its output is validated again
+    preCreate(input, rawInput, tx, context, meta) its output is validated again
     INSERT … RETURNING
-    postCreate(input, result, rawInput, tx)
+    postCreate(input, result, rawInput, tx, context, meta)
     remove the fields the model does not expose
     queue afterCreate on the transaction
 COMMIT
-afterCreate(result, rawInput)                     starts after COMMIT, not awaited
+afterCreate(result, rawInput, context, meta)      starts after COMMIT, not awaited
 ```
 
 Update, delete, find by id and find many follow the same pattern.
@@ -896,34 +988,41 @@ await initializeGenerated({
 #### Hook reference
 
 Every hook returns a promise. `context` is the request context — see
-[Authentication and request context](#authentication-and-request-context).
+[Authentication and request context](#authentication-and-request-context). The write hooks get a trailing `meta`.
 
-| Hook             | Arguments                                  | Returns                                   |
-| ---------------- | ------------------------------------------ | ----------------------------------------- |
-| `beforeCreate`   | `rawInput, context`                        | the input to validate                     |
-| `preCreate`      | `input, rawInput, tx, context`             | the input to insert — validated again     |
-| `postCreate`     | `input, result, rawInput, tx, context`     | the result                                |
-| `afterCreate`    | `result, rawInput, context`                | —                                         |
-| `beforeUpdate`   | `id, rawInput, context`                    | the input to validate                     |
-| `preUpdate`      | `id, input, rawInput, tx, context`         | the changes to apply — validated again    |
-| `postUpdate`     | `id, input, result, rawInput, tx, context` | the result                                |
-| `afterUpdate`    | `result, rawInput, context`                | —                                         |
-| `beforeDelete`   | `id, context`                              | —                                         |
-| `preDelete`      | `id, tx, context`                          | `{ id }`                                  |
-| `postDelete`     | `id, result, tx, context`                  | the result                                |
-| `afterDelete`    | `result, context`                          | —                                         |
-| `beforeFindById` | `id, context`                              | the id                                    |
-| `preFindById`    | `id, tx, context`                          | `{ id }`                                  |
-| `postFindById`   | `id, result, tx, context`                  | the result — called only when a row found |
-| `afterFindById`  | `result, context`                          | —                                         |
-| `beforeFindMany` | `options, context`                         | the options — `where` is already `SQL`    |
-| `preFindMany`    | `tx, options, context`                     | the options                               |
-| `postFindMany`   | `options, results, tx, context`            | the results                               |
-| `afterFindMany`  | `results, context`                         | —                                         |
+| Hook             | Arguments                                        | Returns                                   |
+| ---------------- | ------------------------------------------------ | ----------------------------------------- |
+| `beforeCreate`   | `rawInput, context, meta`                        | the input to validate                     |
+| `preCreate`      | `input, rawInput, tx, context, meta`             | the input to insert — validated again     |
+| `postCreate`     | `input, result, rawInput, tx, context, meta`     | the result                                |
+| `afterCreate`    | `result, rawInput, context, meta`                | —                                         |
+| `beforeUpdate`   | `id, rawInput, context, meta`                    | the input to validate                     |
+| `preUpdate`      | `id, input, rawInput, tx, context, meta`         | the changes to apply — validated again    |
+| `postUpdate`     | `id, input, result, rawInput, tx, context, meta` | the result                                |
+| `afterUpdate`    | `result, rawInput, context, meta`                | —                                         |
+| `beforeDelete`   | `id, context, meta`                              | —                                         |
+| `preDelete`      | `id, tx, context, meta`                          | `{ id }`                                  |
+| `postDelete`     | `id, result, tx, context, meta`                  | the result                                |
+| `afterDelete`    | `result, context, meta`                          | —                                         |
+| `beforeFindById` | `id, context`                                    | the id                                    |
+| `preFindById`    | `id, tx, context`                                | `{ id }`                                  |
+| `postFindById`   | `id, result, tx, context`                        | the result — called only when a row found |
+| `afterFindById`  | `result, context`                                | —                                         |
+| `beforeFindMany` | `options, context`                               | the options — `where` is already `SQL`    |
+| `preFindMany`    | `tx, options, context`                           | the options                               |
+| `postFindMany`   | `options, results, tx, context`                  | the results                               |
+| `afterFindMany`  | `results, context`                               | —                                         |
 
-- `before*` hooks get no transaction handle and see the raw input before validation: authorization checks, input
-  transformation, server-managed values. Through the REST API the transaction is already open when they run, so keep
-  them quick.
+- `meta.trusted` is the call's `options.trusted`. A guard written for client input — a state machine, a locked field —
+  can let server code through on it. It is never inherited: a hook's own domain calls pass their own options, and the
+  REST API never sets it. An update also has `meta.increment`.
+- The `before*` write hooks run inside the caller's transaction, before validation, and get it as `meta.tx`. Read
+  through it, not through `withoutTransaction()`: it sees the rows this transaction already wrote, and needs no second
+  pool connection — with as many concurrent writes as the pool has connections, waiting for a second one deadlocks.
+- A hook may declare fewer parameters than it is given. Code that calls hooks itself — a function composing several hook
+  sets — has to pass `meta`.
+- `before*` hooks see the raw input before validation: authorization checks, input transformation, server-managed
+  values. A throw aborts the operation before it writes anything.
 - `beforeCreate` and `beforeUpdate` see the input after the fields the model does not accept were removed, so they also
   see keys that are no column (a `token` to verify, say); validation drops those afterwards. What they return is the
   input that gets validated — the return type is `Promise<Record<string, unknown>>`, so a hook that forgets to return
@@ -985,6 +1084,7 @@ without a transaction starts its after-hook right away.
 | `ZodError`                  | input validation                             | **400**, the validation issues as the message          |
 | `NotFoundException`         | update or delete of a missing or deleted row | **404**                                                |
 | `InvalidFilterException`    | a filter the domain cannot apply             | **400**                                                |
+| `ConditionFailedException`  | an `update` whose `onlyIf` the row fails     | **409**                                                |
 | a database constraint error | the database                                 | **400** or **409** — see [Status codes](#status-codes) |
 | `HTTPException` (Hono)      | your hooks                                   | its own status, passed through unchanged               |
 | `DomainException`           | your code                                    | **500**                                                |

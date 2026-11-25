@@ -71,6 +71,9 @@ try {
   await sql`DELETE FROM acceptance_test_entity`;
   console.log('Cleaned acceptance_test_entity');
 
+  await sql`DELETE FROM keyed_note`;
+  console.log('Cleaned keyed_note');
+
   console.log('All tables cleaned successfully!');
 } catch (error) {
   console.error('Error cleaning tables:', error);
