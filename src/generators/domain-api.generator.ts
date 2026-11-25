@@ -100,6 +100,25 @@ export interface UpdateOptions<NumericField extends string = string> extends Que
   increment?: Partial<Record<NumericField, number>>;
 }
 
+/**
+ * Options of upsert(): which unique key decides that a row already exists, and what happens then
+ */
+export interface UpsertOptions<UniqueTarget extends readonly string[] = readonly string[]> extends QueryOptions {
+  // The fields of the primary key, a unique field or a unique index (not one with its own where)
+  conflictTarget: UniqueTarget;
+  // 'update': update the existing row (the update pipeline, accept rules as on update);
+  // 'nothing': return it through findById, so the read hooks decide whether the caller sees it
+  onConflict: 'update' | 'nothing';
+}
+
+/**
+ * The outcome of upsert(): the row the caller gets, and which path produced it
+ */
+export interface UpsertResult<T> {
+  row: T;
+  outcome: 'created' | 'updated' | 'unchanged';
+}
+
 
 /**
  * Domain layer hooks with input validation.
@@ -257,11 +276,11 @@ export interface JunctionTableHooks<DomainEnvVars extends Record<string, unknown
 
     return `${drizzleImports}
 import { ConditionFailedException, DomainException, InvalidFilterException, NotFoundException } from './exceptions.ts';
-import { withoutTransaction, withNestedTransaction, runAfterCommit, type DbTransaction } from '../db/database.ts';
+import { withoutTransaction, withNestedTransaction, runAfterCommit, sqlStateOf, type DbTransaction } from '../db/database.ts';
 import { ${modelNameLower}Table, type ${modelName}, type New${modelName}, ${modelNameLower}InsertSchema, ${modelNameLower}UpdateSchema, ${modelNameLower}FieldMeta } from '../schema/${modelNameLower}.schema.ts';
 ${this.generateRelationImports(model)}
 ${this.generateJunctionTableImports(model)}
-import { DomainHooks, JunctionTableHooks, DomainHookContext, QueryOptions, type UpdateOptions, type WriteHookMeta } from './hooks.types.ts';
+import { DomainHooks, JunctionTableHooks, DomainHookContext, QueryOptions, type UpdateOptions, type UpsertOptions, type UpsertResult, type WriteHookMeta } from './hooks.types.ts';
 import { buildWhereSQL, isWhereFilter, stripUnexposedFields, stripUnacceptedFields, validateFilter, type SQL, type WhereFilter } from '../utils/filter.utils.ts';
 import { getExposedFields, getCreateUnexposedFields, getReadUnexposedFields, getCreateUnacceptedFields, getUpdateUnacceptedFields, getTrustedCreateUnacceptedFields, getTrustedUpdateUnacceptedFields } from '../utils/field-meta.utils.ts';
 ${junctionUtilImports}
@@ -280,6 +299,9 @@ export type ${modelName}NumericField = ${this.generateNumericFieldUnion(model)};
 const ${modelNameLower}NumericFields: ReadonlySet<string> = new Set<string>([${
       this.numericFields(model).map((name) => `'${name}'`).join(', ')
     }]);
+
+/** The unique keys upsert() may use as its conflictTarget */
+export type ${modelName}UniqueTarget = ${this.generateUniqueTargetUnion(model)};
 
 export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = Record<string, unknown>> {
   private hooks: DomainHooks<${modelName}, New${modelName}, Partial<New${modelName}>, DomainEnvVars>;
@@ -642,6 +664,75 @@ export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = 
   }
 
   /**
+   * Create the row, or - when a row with the same conflictTarget values exists - update it
+   * (onConflict 'update') or return it ('nothing').
+   *
+   * It means "find by the key, then create or update", with every hook of the path taken, and runs in a
+   * savepoint. A concurrent writer may create the row between the lookup and the create: the create's
+   * unique violation then sends the upsert back to the lookup, once - a second violation propagates (a
+   * soft-deleted row holding the key, which no lookup sees, would otherwise loop for ever).
+   */
+  async upsert(input: New${modelName}, tx: DbTransaction, options: UpsertOptions<${modelName}UniqueTarget>, context?: DomainHookContext<DomainEnvVars>): Promise<UpsertResult<${modelName}>> {
+    return await withNestedTransaction(tx, async (savepoint) => {
+      for (let attempt = 0;; attempt++) {
+        const existing = await this.lockByTarget(input, options.conflictTarget, savepoint);
+        if (existing) {
+          return await this.resolveConflict(existing, input, savepoint, options, context);
+        }
+        try {
+          const row = await withNestedTransaction(savepoint, (inner) => this.create(input, inner, options, context));
+          return { row, outcome: 'created' };
+        } catch (error) {
+          if (attempt > 0 || sqlStateOf(error) !== '23505') {
+            throw error;
+          }
+        }
+      }
+    });
+  }
+
+  /**
+   * The live row whose target fields equal the input's, locked FOR UPDATE; null when there is none, or
+   * when a target value is missing or NULL (NULLs never conflict in a unique index)
+   */
+  private async lockByTarget(input: New${modelName}, target: readonly string[], tx: DbTransaction): Promise<${modelName} | null> {
+    const values = input as unknown as Record<string, unknown>;
+    if (target.some((field) => values[field] === undefined || values[field] === null)) {
+      return null;
+    }
+    const conditions = target.map((field) => eq(${modelNameLower}Table[field as keyof typeof ${modelNameLower}Table] as AnyColumn, values[field]));
+    ${model.softDelete ? `conditions.push(isNull(${modelNameLower}Table.deletedAt));` : ''}
+    const [row] = await tx
+      .select()
+      .from(${modelNameLower}Table)
+      .where(and(...conditions))
+      .limit(1)
+      .for('update');
+    return row ?? null;
+  }
+
+  /**
+   * The conflict path of upsert(): update the existing row, or return it through findById
+   */
+  private async resolveConflict(existing: ${modelName}, input: New${modelName}, tx: DbTransaction, options: UpsertOptions<${modelName}UniqueTarget>, context?: DomainHookContext<DomainEnvVars>): Promise<UpsertResult<${modelName}>> {
+    const id = String(existing.${primaryKeyField});
+    if (options.onConflict === 'nothing') {
+      // Through findById, so its read hooks - a tenant filter, say - decide whether the caller sees it
+      const row = await this.findById(id, tx, options, context);
+      if (!row) {
+        throw new NotFoundException(\`${modelName} with id \${id} not found\`);
+      }
+      return { row, outcome: 'unchanged' };
+    }
+    const changes: Record<string, unknown> = { ...input };
+    for (const field of [...options.conflictTarget, '${primaryKeyField}']) {
+      delete changes[field];
+    }
+    const row = await this.update(id, changes as Partial<New${modelName}>, tx, options, context);
+    return { row, outcome: 'updated' };
+  }
+
+  /**
    * Delete ${modelName}
    */
   async delete(id: string, tx: DbTransaction, options?: QueryOptions, context?: DomainHookContext<DomainEnvVars>): Promise<${modelName}> {
@@ -709,6 +800,23 @@ export const ${modelNameLower}Domain = new ${modelName}Domain();
   private generateNumericFieldUnion(model: ModelDefinition): string {
     const fields = this.numericFields(model);
     return fields.length > 0 ? fields.map((name) => `'${name}'`).join(' | ') : 'never';
+  }
+
+  /**
+   * The unique keys of a model as a TypeScript union of readonly tuples: the primary key, every unique
+   * field and every unique index without a where of its own
+   */
+  private generateUniqueTargetUnion(model: ModelDefinition): string {
+    const primaryKey = model.fields.find((f) => f.primaryKey)?.name || 'id';
+    const targets = [
+      [primaryKey],
+      ...model.fields.filter((field) => field.unique && !field.primaryKey).map((field) => [field.name]),
+      ...(model.indexes ?? []).filter((index) => index.unique && !index.where).map((index) => index.fields),
+    ];
+    const unique = new Map(targets.map((fields) => [fields.join(','), fields]));
+    return Array.from(unique.values())
+      .map((fields) => `readonly [${fields.map((name) => `'${name}'`).join(', ')}]`)
+      .join(' | ');
   }
 
   /**

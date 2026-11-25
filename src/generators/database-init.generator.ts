@@ -184,6 +184,16 @@ const UNKNOWN_TRANSACTION_MESSAGE =
   'after* hooks start once their transaction has committed, so COG has to open that transaction.';
 
 /**
+ * The SQLSTATE of a database error: drizzle wraps the driver's error in a DrizzleQueryError, so the
+ * code is read from its cause first
+ */
+export const sqlStateOf = (error: unknown): string | undefined => {
+  const candidate = error as { cause?: { code?: unknown }; code?: unknown } | undefined;
+  const code = candidate?.cause?.code ?? candidate?.code;
+  return typeof code === 'string' ? code : undefined;
+};
+
+/**
  * Start a task without awaiting it. It starts on a later tick, so the caller's own continuation
  * (building the HTTP response) is not held up; a failure is logged, never thrown.
  */
@@ -301,7 +311,7 @@ export async function withTransaction<T>(
 
       // Check if this is a serialization error (error code 40001)
       // This occurs in both CockroachDB (WriteTooOldError) and PostgreSQL (serialization_failure)
-      const errorCode = (error as { cause?: { code?: string }; code?: string } | undefined)?.cause?.code || (error as { code?: string } | undefined)?.code;
+      const errorCode = sqlStateOf(error);
       const isSerializationError = errorCode === '40001';
 
       // Only retry on serialization errors if retries are enabled
