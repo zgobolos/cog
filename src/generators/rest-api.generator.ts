@@ -149,7 +149,7 @@ export type DefaultEnv = {
   private generateRestHelpers(): string {
     return `import { HTTPException } from '@hono/hono/http-exception';
 import type { Context } from '@hono/hono';
-import { NotFoundException, InvalidFilterException, DomainException } from '../domain/exceptions.ts';
+import { NotFoundException, InvalidFilterException, ConditionFailedException, DomainException } from '../domain/exceptions.ts';
 
 // Re-export filter utilities for use in REST handlers
 export {
@@ -268,6 +268,10 @@ export function handleDomainException(error: unknown, operation?: 'delete'): nev
   // A filter the domain cannot apply - unknown or hidden field, unsupported operator - is the caller's mistake
   if (error instanceof InvalidFilterException) {
     throw new HTTPException(400, { message: error.message });
+  }
+  // A conditional update whose row no longer matches - e.g. called from a hook during the request
+  if (error instanceof ConditionFailedException) {
+    throw new HTTPException(409, { message: error.message });
   }
   if (error instanceof DomainException) {
     throw new HTTPException(500, { message: error.message });

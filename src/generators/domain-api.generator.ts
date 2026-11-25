@@ -85,6 +85,21 @@ export interface QueryOptions {
   trusted?: boolean;
 }
 
+/**
+ * Options of update(): QueryOptions plus the conditional and atomic parts. Both are server-only by
+ * construction - the generated REST layer passes neither - and both make the update run in a savepoint,
+ * so a failure also undoes what its before* and pre* hooks wrote.
+ */
+export interface UpdateOptions<NumericField extends string = string> extends QueryOptions {
+  // Update only if the row also matches this condition (a WhereFilter, validated like a findMany filter -
+  // a hidden field needs the SQL form - or an SQL condition). A row that exists but does not match
+  // throws ConditionFailedException; a missing row NotFoundException
+  onlyIf?: WhereFilter | SQL;
+  // Add to numeric fields in SQL (field = field + amount), atomic under concurrency. A field may not be
+  // both set by the input and incremented. post* and after* see the computed value
+  increment?: Partial<Record<NumericField, number>>;
+}
+
 
 /**
  * Domain layer hooks with input validation.
@@ -226,11 +241,7 @@ export interface JunctionTableHooks<DomainEnvVars extends Record<string, unknown
 
     // We need inArray for batch fetching in findMany when there are relationships
     // We need AnyColumn for orderBy type casting
-    let drizzleImports = 'import { eq, desc, asc, sql, type AnyColumn';
-    const needsAnd = hasManyToMany || !!model.softDelete;
-    if (needsAnd) {
-      drizzleImports += ', and';
-    }
+    let drizzleImports = 'import { eq, desc, asc, sql, and, type AnyColumn';
     if (hasManyToMany || hasRelationships) {
       drizzleImports += ', inArray';
     }
@@ -245,13 +256,13 @@ export interface JunctionTableHooks<DomainEnvVars extends Record<string, unknown
       : '';
 
     return `${drizzleImports}
-import { InvalidFilterException, NotFoundException } from './exceptions.ts';
-import { withoutTransaction, runAfterCommit, type DbTransaction } from '../db/database.ts';
+import { ConditionFailedException, DomainException, InvalidFilterException, NotFoundException } from './exceptions.ts';
+import { withoutTransaction, withNestedTransaction, runAfterCommit, type DbTransaction } from '../db/database.ts';
 import { ${modelNameLower}Table, type ${modelName}, type New${modelName}, ${modelNameLower}InsertSchema, ${modelNameLower}UpdateSchema, ${modelNameLower}FieldMeta } from '../schema/${modelNameLower}.schema.ts';
 ${this.generateRelationImports(model)}
 ${this.generateJunctionTableImports(model)}
-import { DomainHooks, JunctionTableHooks, DomainHookContext, QueryOptions, type WriteHookMeta } from './hooks.types.ts';
-import { buildWhereSQL, isWhereFilter, stripUnexposedFields, stripUnacceptedFields, validateFilter, type SQL } from '../utils/filter.utils.ts';
+import { DomainHooks, JunctionTableHooks, DomainHookContext, QueryOptions, type UpdateOptions, type WriteHookMeta } from './hooks.types.ts';
+import { buildWhereSQL, isWhereFilter, stripUnexposedFields, stripUnacceptedFields, validateFilter, type SQL, type WhereFilter } from '../utils/filter.utils.ts';
 import { getExposedFields, getCreateUnexposedFields, getReadUnexposedFields, getCreateUnacceptedFields, getUpdateUnacceptedFields, getTrustedCreateUnacceptedFields, getTrustedUpdateUnacceptedFields } from '../utils/field-meta.utils.ts';
 ${junctionUtilImports}
 
@@ -263,6 +274,12 @@ const ${modelNameLower}CreateUnacceptedFields = getCreateUnacceptedFields(${mode
 const ${modelNameLower}UpdateUnacceptedFields = getUpdateUnacceptedFields(${modelNameLower}FieldMeta);
 const ${modelNameLower}TrustedCreateUnacceptedFields = getTrustedCreateUnacceptedFields(${modelNameLower}FieldMeta);
 const ${modelNameLower}TrustedUpdateUnacceptedFields = getTrustedUpdateUnacceptedFields(${modelNameLower}FieldMeta);
+
+/** The fields update() may increment (options.increment) */
+export type ${modelName}NumericField = ${this.generateNumericFieldUnion(model)};
+const ${modelNameLower}NumericFields: ReadonlySet<string> = new Set<string>([${
+      this.numericFields(model).map((name) => `'${name}'`).join(', ')
+    }]);
 
 export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = Record<string, unknown>> {
   private hooks: DomainHooks<${modelName}, New${modelName}, Partial<New${modelName}>, DomainEnvVars>;
@@ -399,15 +416,8 @@ export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = 
   ): Promise<{ data: ${modelName}[]; total: number }> {
     // Convert WhereFilter to SQL first (so hooks receive SQL, not raw filter objects). A condition that
     // cannot be applied is refused: dropping it would widen the result.
-    if (options.where && isWhereFilter(options.where)) {
-      const validation = validateFilter(options.where, ${modelNameLower}FieldMeta);
-      if (!validation.valid) {
-        throw new InvalidFilterException(validation.error ?? 'Invalid filter');
-      }
-      options = {
-        ...options,
-        where: buildWhereSQL(options.where, ${modelNameLower}Table, ${modelNameLower}ExposedFields),
-      };
+    if (options.where) {
+      options = { ...options, where: this.toWhereSQL(options.where) };
     }
 
     // Before-find-many hook (outside transaction, receives SQL)
@@ -499,15 +509,32 @@ export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = 
 
   /**
    * Update ${modelName}
+   *
+   * With options.onlyIf or options.increment the update runs in a savepoint: when it fails, what its own
+   * before* and pre* hooks wrote is undone too, so a caller may catch the error and carry on.
    */
-  async update(id: string, input: Partial<New${modelName}>, tx: DbTransaction, options?: QueryOptions, context?: DomainHookContext<DomainEnvVars>): Promise<${modelName}> {
+  async update(id: string, input: Partial<New${modelName}>, tx: DbTransaction, options?: UpdateOptions<${modelName}NumericField>, context?: DomainHookContext<DomainEnvVars>): Promise<${modelName}> {
+    if (options?.onlyIf !== undefined || options?.increment !== undefined) {
+      return await withNestedTransaction(tx, (savepoint) => this.updateRow(id, input, savepoint, options, context));
+    }
+    return await this.updateRow(id, input, tx, options, context);
+  }
+
+  private async updateRow(id: string, input: Partial<New${modelName}>, tx: DbTransaction, options?: UpdateOptions<${modelName}NumericField>, context?: DomainHookContext<DomainEnvVars>): Promise<${modelName}> {
+    // The condition is checked like a findMany filter, before any hook runs
+    const onlyIf = options?.onlyIf === undefined ? undefined : this.toWhereSQL(options.onlyIf);
+    const increment = options?.increment as Readonly<Record<string, number>> | undefined;
+    if (increment) {
+      this.assertIncrement(increment);
+    }
+
     // Strip unaccepted fields from input (before any hooks); a trusted write keeps all but COG's own columns
     const strippedInput = stripUnacceptedFields(
       input as unknown as Record<string, unknown>,
       options?.trusted ? ${modelNameLower}TrustedUpdateUnacceptedFields : ${modelNameLower}UpdateUnacceptedFields,
     );
 
-    const meta: WriteHookMeta = { trusted: options?.trusted === true };
+    const meta: WriteHookMeta = { trusted: options?.trusted === true, increment };
 
     // Before-update hook (in the caller's transaction, before validation)
     // Hook can inject server-managed fields that were stripped
@@ -528,22 +555,28 @@ export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = 
     }
 
     // Unaccepted fields (id, timestamps) already stripped via stripUnacceptedFields
+    const values: Record<string, unknown> = { ...processedInput };
+    for (const [field, amount] of Object.entries(increment ?? {})) {
+      // Checked on the final input: a before* or pre* hook may have set the field too
+      if (field in values) {
+        throw new DomainException(\`${modelName}.\${field} is both set and incremented\`);
+      }
+      values[field] = sql\`\${${modelNameLower}Table[field as keyof typeof ${modelNameLower}Table] as AnyColumn} + \${amount}\`;
+    }
+    ${model.timestamps ? 'values.updatedAt = sql`(extract(epoch from now()) * 1000)::bigint`;' : ''}
 
     // Perform update
+    const rowCondition = ${this.generateLiveRowCondition(model)};
     const [updated] = await tx
       .update(${modelNameLower}Table)
-      .set({
-        ...processedInput,
-        ${model.timestamps ? 'updatedAt: sql`(extract(epoch from now()) * 1000)::bigint`,' : ''}
-      })
-      .where(${
-      model.softDelete
-        ? `and(eq(${modelNameLower}Table.${primaryKeyField}, id), isNull(${modelNameLower}Table.deletedAt))`
-        : `eq(${modelNameLower}Table.${primaryKeyField}, id)`
-    })
+      .set(values as Partial<New${modelName}>)
+      .where(onlyIf ? and(rowCondition, onlyIf) : rowCondition)
       .returning();
 
     if (!updated) {
+      if (onlyIf && (await this.rowExists(id, tx))) {
+        throw new ConditionFailedException(\`${modelName} with id \${id} does not match the update condition\`);
+      }
       throw new NotFoundException(\`${modelName} with id \${id} not found\`);
     }
 
@@ -565,6 +598,47 @@ export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = 
     }
 
     return result;
+  }
+
+  /**
+   * A WhereFilter as SQL (undefined for an empty one), refused when it cannot be applied: dropping the
+   * condition would widen it
+   */
+  private toWhereSQL(where: WhereFilter | SQL): SQL | undefined {
+    if (!isWhereFilter(where)) {
+      return where;
+    }
+    const validation = validateFilter(where, ${modelNameLower}FieldMeta);
+    if (!validation.valid) {
+      throw new InvalidFilterException(validation.error ?? 'Invalid filter');
+    }
+    return buildWhereSQL(where, ${modelNameLower}Table, ${modelNameLower}ExposedFields);
+  }
+
+  /**
+   * Refuse an increment of anything but a numeric field, or by anything but a finite number
+   */
+  private assertIncrement(increment: Readonly<Record<string, number>>): void {
+    for (const [field, amount] of Object.entries(increment)) {
+      if (!${modelNameLower}NumericFields.has(field)) {
+        throw new DomainException(\`${modelName}.\${field} is not a numeric field and cannot be incremented\`);
+      }
+      if (typeof amount !== 'number' || !Number.isFinite(amount)) {
+        throw new DomainException(\`${modelName}.\${field} cannot be incremented by \${amount}\`);
+      }
+    }
+  }
+
+  /**
+   * Whether the row exists (and is not soft-deleted), read in the given transaction
+   */
+  private async rowExists(id: string, tx: DbTransaction): Promise<boolean> {
+    const rows = await tx
+      .select({ id: ${modelNameLower}Table.${primaryKeyField} })
+      .from(${modelNameLower}Table)
+      .where(${this.generateLiveRowCondition(model)})
+      .limit(1);
+    return rows.length > 0;
   }
 
   /**
@@ -618,6 +692,32 @@ export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = 
 // Export singleton instance (uses default Record<string, unknown> for EnvVars)
 export const ${modelNameLower}Domain = new ${modelName}Domain();
 `;
+  }
+
+  /**
+   * The numeric fields of a model (integer, bigint, decimal; not arrays): the ones update() may increment
+   */
+  private numericFields(model: ModelDefinition): string[] {
+    return model.fields
+      .filter((field) => ['integer', 'bigint', 'decimal'].includes(field.type) && !field.array)
+      .map((field) => field.name);
+  }
+
+  /**
+   * The numeric fields as a TypeScript union of string literals, never without any
+   */
+  private generateNumericFieldUnion(model: ModelDefinition): string {
+    const fields = this.numericFields(model);
+    return fields.length > 0 ? fields.map((name) => `'${name}'`).join(' | ') : 'never';
+  }
+
+  /**
+   * The SQL condition selecting the row whose primary key is id, skipping it when soft-deleted
+   */
+  private generateLiveRowCondition(model: ModelDefinition): string {
+    const table = `${model.name.toLowerCase()}Table`;
+    const pk = model.fields.find((f) => f.primaryKey)?.name || 'id';
+    return model.softDelete ? `and(eq(${table}.${pk}, id), isNull(${table}.deletedAt))` : `eq(${table}.${pk}, id)`;
   }
 
   /**

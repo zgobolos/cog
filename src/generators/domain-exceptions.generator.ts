@@ -49,6 +49,18 @@ export class InvalidFilterException extends DomainException {
     this.name = 'InvalidFilterException';
   }
 }
+
+/**
+ * Thrown when a conditional update (options.onlyIf) finds its row, but the row does not match the
+ * condition - another writer got there first, or the state no longer allows the change.
+ * Typically maps to HTTP 409 Conflict
+ */
+export class ConditionFailedException extends DomainException {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ConditionFailedException';
+  }
+}
 `;
   }
 }
