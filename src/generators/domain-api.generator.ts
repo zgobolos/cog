@@ -260,18 +260,13 @@ export interface JunctionTableHooks<DomainEnvVars extends Record<string, unknown
     const primaryKeyField = model.fields.find((f) => f.primaryKey)?.name ||
       'id';
 
-    // Check if we need additional imports for relationships
-    const hasRelationships = model.relationships && model.relationships.length > 0;
     const hasManyToMany = model.relationships?.some((rel) => rel.type === 'manyToMany');
 
-    // We need inArray for batch fetching in findMany when there are relationships
-    // We need AnyColumn for orderBy type casting
-    let drizzleImports = `import { eq, desc, asc, sql, and, ${
+    // inArray batches relationship includes and the row locks of deleteMany; AnyColumn types dynamic
+    // column access (orderBy, increment, upsert targets); getTableColumns sizes the createMany chunks
+    let drizzleImports = `import { eq, desc, asc, sql, and, inArray, ${
       this.isCockroachDB ? '' : 'getTableColumns, '
     }type AnyColumn`;
-    if (hasManyToMany || hasRelationships) {
-      drizzleImports += ', inArray';
-    }
     if (model.softDelete) {
       drizzleImports += ', isNull';
     }
@@ -851,6 +846,55 @@ export class ${modelName}Domain<DomainEnvVars extends Record<string, unknown> = 
     }
 
     return result;
+  }
+
+  /**
+   * Delete every ${modelName} matching where: the same as delete() for each row, with every hook per row,
+   * in a savepoint - a before* or pre* throw aborts the call and restores the rows already deleted.
+   *
+   * The rows are selected through findMany, so its read hooks scope the selection (a tenant filter), with
+   * no limit, offset or include: a find hook that paginates it is refused, so deleteMany never deletes
+   * part of its match without saying so. The selected rows are then locked FOR UPDATE in primary key
+   * order; a row deleted elsewhere in between is left out instead of failing the call halfway.
+   */
+  async deleteMany(where: WhereFilter | SQL, tx: DbTransaction, options?: QueryOptions, context?: DomainHookContext<DomainEnvVars>): Promise<${modelName}[]> {
+    return await withNestedTransaction(tx, async (savepoint) => {
+      const { data, total } = await this.findMany(savepoint, { where, orderBy: '${primaryKeyField}', skipSanitization: true }, context);
+      if (data.length !== total) {
+        throw new DomainException(\`${modelName}.deleteMany: a find hook limited the selection to \${data.length} of \${total} rows\`);
+      }
+
+      const ids = await this.lockLiveRows(data.map((row) => row.${primaryKeyField}), savepoint);
+      const deleted: ${modelName}[] = [];
+      for (const id of ids) {
+        deleted.push(await this.delete(String(id), savepoint, options, context));
+      }
+      return deleted;
+    });
+  }
+
+  /**
+   * The given rows that are still live, locked FOR UPDATE, in the given order
+   */
+  private async lockLiveRows(ids: Array<${modelName}['${primaryKeyField}']>, tx: DbTransaction): Promise<Array<${modelName}['${primaryKeyField}']>> {
+    const locked = new Set<${modelName}['${primaryKeyField}']>();
+    // Chunked: a statement takes at most 65 535 parameters
+    for (let start = 0; start < ids.length; start += 10_000) {
+      const rows = await tx
+        .select({ id: ${modelNameLower}Table.${primaryKeyField} })
+        .from(${modelNameLower}Table)
+        .where(${
+      model.softDelete
+        ? `and(inArray(${modelNameLower}Table.${primaryKeyField}, ids.slice(start, start + 10_000)), isNull(${modelNameLower}Table.deletedAt))`
+        : `inArray(${modelNameLower}Table.${primaryKeyField}, ids.slice(start, start + 10_000))`
+    })
+        .orderBy(${modelNameLower}Table.${primaryKeyField})
+        .for('update');
+      for (const row of rows) {
+        locked.add(row.id);
+      }
+    }
+    return ids.filter((id) => locked.has(id));
   }
 
   ${this.generateRelationshipMethods(model)}
