@@ -595,8 +595,9 @@ actually generated), and a generator test asserts that the constant, this block,
 
 Each entry carries a `kind` that drives the grouping in the generator output:
 
-- `runtime` — `@hono/hono`, `drizzle-orm`, `drizzle-zod`, `postgres`, `zod` (type-only in the generated code, but
-  drizzle-zod resolves it as a runtime peer)
+- `runtime` — `@hono/hono`, `drizzle-orm`, `drizzle-zod`, `postgres`, `zod` (not imported by the generated code since
+  2.5 removed `base.domain.ts`, its last type import; it stays in the report as drizzle-zod's runtime peer, through
+  `peerOf` in `GENERATED_CODE_DEPENDENCIES`)
 - `types` — `openapi-types`, a type-only import in `rest/openapi.ts`; belongs to dev dependencies where that split
   exists
 - `optional` — `@scalar/hono-api-reference`, never imported by the generated code, listed as a suggestion for the API

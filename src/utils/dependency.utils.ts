@@ -55,9 +55,19 @@ export const collectImportedPackages = (files: Map<string, string>): string[] =>
 };
 
 /**
+ * The imported packages plus the peer dependencies they need (zod for drizzle-zod), sorted
+ */
+const withPeerDependencies = (imported: string[]): string[] => {
+  const peers = Object.entries(GENERATED_CODE_DEPENDENCIES)
+    .filter(([, dependency]) => dependency.peerOf !== undefined && imported.includes(dependency.peerOf))
+    .map(([name]) => name);
+  return [...new Set([...imported, ...peers])].sort();
+};
+
+/**
  * Builds the dependency report for a set of generated files.
- * The required packages come from the files themselves, so the report always matches what was
- * generated; the optional ones are suggestions that no generated file imports.
+ * The required packages come from the files themselves and the peers those need, so the report
+ * always matches what was generated; the optional ones are suggestions that no generated file imports.
  */
 export const resolveDependencies = (files: Map<string, string>): DependencyReport => {
   const report: DependencyReport = { runtime: {}, dev: {}, optional: {}, unresolved: [] };
@@ -66,7 +76,7 @@ export const resolveDependencies = (files: Map<string, string>): DependencyRepor
     dev: report.dev,
   };
 
-  for (const name of collectImportedPackages(files)) {
+  for (const name of withPeerDependencies(collectImportedPackages(files))) {
     const dependency = GENERATED_CODE_DEPENDENCIES[name];
     if (!dependency) {
       report.unresolved.push(name);

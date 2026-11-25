@@ -1173,8 +1173,10 @@ Deno.test('generator - hook registration, strict domain filters and exported exc
     assertEquals(authorRest.includes('addGenreList(id, ids, body, tx, c.var)'), true);
     assertEquals(authorRest.includes('removeGenre(id, relatedId, body, tx, c.var)'), true);
 
-    // findMany refuses a filter it cannot apply instead of dropping the condition
-    assertEquals(authorDomain.includes('validateFilter(options.where, authorFieldMeta)'), true);
+    // findMany refuses a filter it cannot apply instead of dropping the condition (through toWhereSQL,
+    // which update's onlyIf shares)
+    assertEquals(authorDomain.includes('options = { ...options, where: this.toWhereSQL(options.where) };'), true);
+    assertEquals(authorDomain.includes('validateFilter(where, authorFieldMeta)'), true);
     assertEquals(authorDomain.includes("throw new InvalidFilterException(validation.error ?? 'Invalid filter')"), true);
     assertEquals(
       /if \(error instanceof InvalidFilterException\) \{\s*\n\s*throw new HTTPException\(400/.test(helpers),
@@ -1398,7 +1400,7 @@ Deno.test('generator - before-hooks must return the input to validate', async ()
     assertEquals(hooksTypes.includes('Promise<unknown>'), false);
     assertEquals(
       hooksTypes.includes(
-        'beforeCreate?: (rawInput: unknown, context?: DomainHookContext<DomainEnvVars>) => Promise<Record<string, unknown>>;',
+        'beforeCreate?: (rawInput: unknown, context: DomainHookContext<DomainEnvVars> | undefined, meta: BeforeWriteHookMeta) => Promise<Record<string, unknown>>;',
       ),
       true,
     );
@@ -1441,8 +1443,11 @@ Deno.test('generator - trusted writes lift accept rules for server code only', a
     assertEquals(hasTrustedFlags('deletedAt', false, false), true);
 
     const domain = await read('domain/ownership.domain.ts');
+    // create: keepTimestamps (2.5) only narrows the trusted list further
     assertEquals(
-      domain.includes('options?.trusted ? ownershipTrustedCreateUnacceptedFields : ownershipCreateUnacceptedFields'),
+      domain.includes(
+        '? (options.keepTimestamps ? ownershipKeepTimestampsCreateUnacceptedFields : ownershipTrustedCreateUnacceptedFields)\n        : ownershipCreateUnacceptedFields',
+      ),
       true,
     );
     assertEquals(
@@ -1506,7 +1511,15 @@ Deno.test('generator - 2.5 write operations', async () => {
       ),
       true,
     );
-    assertEquals(hooksTypes.includes('NO transaction parameter'), false);
+    // The model hooks no longer claim to run outside the transaction (the junction hooks are unchanged)
+    assertEquals(
+      hooksTypes.includes("// Before-operation hooks (inside the caller's transaction, before validation)"),
+      true,
+    );
+    assertEquals(
+      hooksTypes.split('export interface JunctionTableHooks')[0].includes('outside transaction, before'),
+      false,
+    );
     assertEquals((domain.match(/context, \{ \.\.\.meta, tx \}\)/g) ?? []).length, 3, 'beforeCreate/Update/Delete');
 
     // §3: onlyIf and increment run the update in a savepoint; numeric fields exclude dates and arrays

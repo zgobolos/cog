@@ -72,6 +72,8 @@ export interface GeneratedDependency {
   kind: DependencyKind;
   /** Why it is needed - shown in the generator output for anything that is not plainly required */
   reason?: string;
+  /** A peer dependency of this package: required whenever that package is imported, imported or not */
+  peerOf?: string;
 }
 
 /**
@@ -96,6 +98,6 @@ export const GENERATED_CODE_DEPENDENCIES: Record<string, GeneratedDependency> = 
   'drizzle-zod': { specifier: 'npm:drizzle-zod@^0.8.3', kind: 'runtime' },
   'openapi-types': { specifier: 'npm:openapi-types@^12.1.3', kind: 'dev' },
   'postgres': { specifier: 'npm:postgres@^3.4.9', kind: 'runtime' },
-  // Imported as a type only, but drizzle-zod resolves it as a runtime peer dependency
-  'zod': { specifier: 'npm:zod@^4.6.5', kind: 'runtime' },
+  // Not imported by the generated code: drizzle-zod resolves it as a runtime peer dependency
+  'zod': { specifier: 'npm:zod@^4.6.5', kind: 'runtime', peerOf: 'drizzle-zod' },
 };
